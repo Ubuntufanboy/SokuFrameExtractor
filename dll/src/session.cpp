@@ -129,8 +129,13 @@ constexpr int VTBL_DESTRUCT_IDX = 0;
 // long we wait before proceeding anyway. Generous because a CPU-capped
 // container running llvmpipe boots far slower than real hardware: at a fixed
 // 10 s the game was still on the logo (scene 0).
-constexpr uint32_t MS_TITLE_DEADLINE = 60000;
-constexpr uint32_t MS_BATTLE_DEADLINE = 90000; // nav start -> battle, else fail
+// Both are bounds on pathology, not pacing -- the FSM polls the scene id and
+// moves the instant it changes. They are generous because they have to cover
+// the *loaded* case: a single capture reaches the battle in 12 s, but with ten
+// workers sharing the machine the same boot took 40 s, and a deadline tuned to
+// the idle case fails replays that were about to work.
+constexpr uint32_t MS_TITLE_DEADLINE  = 120000;
+constexpr uint32_t MS_BATTLE_DEADLINE = 240000; // start armed -> battle, else fail
 constexpr uint32_t MS_DRAIN          = 1500;   // post-match settle before stop
 constexpr uint32_t MS_FIFO_DEADLINE  = 60000;  // wait for FFmpeg to attach
 

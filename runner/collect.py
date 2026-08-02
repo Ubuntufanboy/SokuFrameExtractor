@@ -79,6 +79,23 @@ class PrefixLock:
         self.path.unlink(missing_ok=True)
 
 
+def used_gb(path: Path) -> float:
+    """Bytes written under `path`, in GB.
+
+    Walked rather than tracked incrementally: the run is resumable and may be
+    restarted, so the budget has to reflect what is on disk now, not what this
+    process happens to have produced.
+    """
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total / (1024 ** 3)
+
+
 def find_replays(replay_dir: Path) -> list[Path]:
     return sorted(p for p in replay_dir.rglob("*") if p.suffix.lower() == ".rep")
 
@@ -147,6 +164,7 @@ def capture_one(
     timeout_s: float,
     vaapi: bool,
     crf: int,
+    square: int,
     verbose: bool,
 ) -> manifest.Entry:
     """Capture a single replay. Always returns an Entry; never raises for
@@ -199,6 +217,7 @@ def capture_one(
             out_mp4=out_dir / "video.mp4",
             vaapi=vaapi,
             crf=crf,
+            square=square,
             log_path=out_dir / "ffmpeg.log",
             n_cpus=n_cpus,
         ) as enc, wine.Xvfb() as xvfb:
@@ -284,9 +303,19 @@ def main(argv: list[str] | None = None) -> int:
                          f"(default {throttle.default_cpu_count()})")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
                     help="per-replay wall-clock limit in seconds")
-    ap.add_argument("--crf", type=int, default=23, help="H.264 quality (lower=better)")
+    ap.add_argument("--crf", type=int, default=encode.DEFAULT_CRF,
+                    help=f"H.264 quality, lower=better "
+                         f"(default {encode.DEFAULT_CRF}, calibrated to stay "
+                         f"under {encode.MB_PER_HOUR_BUDGET} MB per hour)")
+    ap.add_argument("--square", type=int, default=encode.SQUARE,
+                    help=f"output edge length; 4:3 is squashed to 1:1 "
+                         f"(default {encode.SQUARE})")
     ap.add_argument("--vaapi", action="store_true",
                     help="use GPU encoding if available")
+    ap.add_argument("--max-output-gb", type=float, default=0.0,
+                    help="stop once this much has been written to --out "
+                         "(0 = no limit). Enforced where the space is actually "
+                         "spent, so no length prediction is needed.")
     ap.add_argument("--resume", action="store_true",
                     help="skip replays already recorded ok in the manifest")
     ap.add_argument("--verbose", action="store_true", help="verbose DLL logging")
@@ -388,6 +417,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  aborting: free space below {MIN_FREE_GB} GB")
                 break
 
+            if args.max_output_gb:
+                used = used_gb(args.out)
+                if used >= args.max_output_gb:
+                    print(f"  budget reached: {used:.1f} GB written of "
+                          f"{args.max_output_gb:.1f} GB allowed")
+                    break
+
             entry = capture_one(
                 rep,
                 prefix=args.prefix,
@@ -399,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_s=args.timeout,
                 vaapi=vaapi,
                 crf=args.crf,
+                square=args.square,
                 verbose=args.verbose,
             )
             manifest.append(args.out, entry)

@@ -28,6 +28,59 @@ from . import throttle
 GAME_W, GAME_H = 640, 480
 FPS = 60
 
+# -------------------------------------------------------------------------
+# Output geometry
+# -------------------------------------------------------------------------
+# The game renders 640x480; the dataset wants 1:1. The frame is *squashed*
+# to a square rather than padded or cropped:
+#
+#   pad  -> 25% of every frame is black. Cheap in H.264, but the pixels still
+#           cost a tensor slot at training time.
+#   crop -> loses the left and right edges, which is exactly where the two
+#           players are during zoning. Destroys the behaviour worth learning.
+#   squash -> keeps every pixel, wastes none, and distorts horizontally by a
+#           constant 0.75. A constant is something a model absorbs for free.
+#
+# 480 keeps the full vertical resolution, so the only resampling is
+# horizontal (640 -> 480). Lanczos rather than the bilinear default: Soku's
+# art is high-contrast pixel work with 1px outlines, and bilinear visibly
+# muddies it at this ratio.
+SQUARE = 480
+
+# -------------------------------------------------------------------------
+# Bitrate budget
+# -------------------------------------------------------------------------
+# The requirement is a hard ceiling of 700 MB per hour of footage:
+#
+#   700 MB/h = 700e6 * 8 / 3600 bits/s = 1.556 Mbit/s
+#
+# CRF alone cannot promise that -- it targets quality and lets the bitrate go
+# where it must. So CRF sets the quality and a VBV cap makes the ceiling
+# real: over any window of `bufsize` bits the rate cannot exceed `maxrate`,
+# which bounds the file for any duration.
+#
+# The cap is set below the budget, not at it, so the container overhead and
+# the mp4 index still fit underneath. It only engages during the busiest
+# scenes; typical footage lands well under it.
+#
+# Measured on a real 302 s capture, squashed to 480x480:
+#
+#   preset      crf   MB/hour   encode fps
+#   medium      26        681           97
+#   medium      28        524          137
+#   fast        26        689          152
+#   veryfast    26        625          246   <- default
+#   veryfast    24       (higher)      ...
+#
+# veryfast/26 is the choice: 625 MB/h leaves ~11% headroom under the budget,
+# and 246 fps is comfortably ahead of the ~95 fps the capture produces. The
+# encoder must outrun the game or the ring buffer back-pressures the render
+# thread -- which is why `medium` is not used despite compressing better.
+MB_PER_HOUR_BUDGET = 700
+MAXRATE_KBIT = 1500          # 675 MB/h ceiling
+BUFSIZE_KBIT = 3000          # 2 s VBV window
+DEFAULT_CRF = 26
+
 
 def has_vaapi(device: str = "/dev/dri/renderD128") -> bool:
     """True if VAAPI hardware encoding looks available.
@@ -53,14 +106,12 @@ def build_command(
     out_mp4: Path,
     *,
     vaapi: bool,
-    crf: int = 23,
+    crf: int = DEFAULT_CRF,
+    square: int = SQUARE,
+    threads: int = 4,
     vaapi_device: str = "/dev/dri/renderD128",
 ) -> list[str]:
-    """FFmpeg argv for reading raw BGRA off `fifo` into `out_mp4`.
-
-    `vflip` is not cosmetic: glReadPixels returns rows bottom-up, so without it
-    every captured frame is upside down.
-    """
+    """FFmpeg argv for reading raw BGRA off `fifo` into a square `out_mp4`."""
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
         "-f", "rawvideo",
@@ -69,18 +120,30 @@ def build_command(
         "-r", str(FPS),
         "-i", str(fifo),
     ]
+    # vflip is not cosmetic (glReadPixels is bottom-up); the scale is the
+    # 4:3 -> 1:1 squash described at the top of this module.
+    scale = f"scale={square}:{square}:flags=lanczos"
+
     if vaapi:
         cmd += [
             "-vaapi_device", vaapi_device,
-            "-vf", "vflip,format=nv12,hwupload",
+            "-vf", f"vflip,{scale},format=nv12,hwupload",
             "-c:v", "h264_vaapi", "-qp", str(crf),
+            "-maxrate", f"{MAXRATE_KBIT}k", "-bufsize", f"{BUFSIZE_KBIT}k",
         ]
     else:
         cmd += [
-            "-vf", "vflip",
+            "-vf", f"vflip,{scale}",
             "-c:v", "libx264",
-            "-preset", "veryfast",   # capture is CPU-bound; don't fight the game for cores
+            "-preset", "veryfast",   # must outrun capture; see the note above
             "-crf", str(crf),
+            "-maxrate", f"{MAXRATE_KBIT}k",
+            "-bufsize", f"{BUFSIZE_KBIT}k",
+            "-g", "120",             # 2 s GOP: keeps the VBV cap enforceable
+            # x264 otherwise sizes its thread pool from the machine, not from
+            # the cpuset it was given, so ten concurrent encoders would each
+            # spawn ~48 threads onto four pinned cores.
+            "-threads", str(max(1, threads)),
             "-pix_fmt", "yuv420p",   # required for broad playback compatibility
         ]
     cmd += ["-movflags", "+faststart", str(out_mp4)]
@@ -94,7 +157,8 @@ class Encoder:
     fifo: Path
     out_mp4: Path
     vaapi: bool = False
-    crf: int = 23
+    crf: int = DEFAULT_CRF
+    square: int = SQUARE
     log_path: Path | None = None
     n_cpus: int = 0
 
@@ -117,7 +181,9 @@ class Encoder:
         # x264 defaults to one thread per core and would otherwise compete with
         # the game's software rasteriser for the same cores.
         argv = throttle.wrap(
-            build_command(self.fifo, self.out_mp4, vaapi=self.vaapi, crf=self.crf),
+            build_command(self.fifo, self.out_mp4, vaapi=self.vaapi,
+                          crf=self.crf, square=self.square,
+                          threads=self.n_cpus or 4),
             n_cpus=self.n_cpus,
         )
 

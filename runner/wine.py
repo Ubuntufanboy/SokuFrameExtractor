@@ -82,13 +82,25 @@ class WineError(RuntimeError):
     pass
 
 
-def _free_display(start: int = 90, end: int = 200) -> int:
-    """Find an X display number nobody is using.
+# Each concurrent worker reserves its own block of display numbers, set from
+# SFE_DISPLAY_BASE. Probing for a free display is inherently racy: ten workers
+# starting at once all see :90 unused and all try to claim it, and the losers
+# fail in a way that looks like "Xvfb did not come up". Partitioning the range
+# by worker removes the race instead of narrowing it.
+DISPLAY_RANGE = 10
+
+
+def _free_display(start: int | None = None, end: int | None = None) -> int:
+    """Find an X display number nobody is using, within this worker's block.
 
     Checks both the abstract socket path and the lock file: a stale
     /tmp/.X<n>-lock from a killed Xvfb would otherwise make us think a display
     is taken forever.
     """
+    if start is None:
+        start = int(os.environ.get("SFE_DISPLAY_BASE", "90"))
+    if end is None:
+        end = start + DISPLAY_RANGE
     for n in range(start, end):
         if Path(f"/tmp/.X11-unix/X{n}").exists():
             continue
