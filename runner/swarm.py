@@ -45,7 +45,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import throttle
+from . import encode, throttle
 
 # Files big enough to be worth sharing and known never to be written.
 SHARED_SUFFIXES = (".dat",)
@@ -277,7 +277,7 @@ def _dir_bytes(p: Path) -> int:
 def cmd_status(args) -> int:
     rows = []
     total_ok = total_fail = 0
-    total_bytes = 0
+    total_bytes = total_video = 0
     total_frames = 0
 
     for i in range(args.workers):
@@ -289,6 +289,7 @@ def cmd_status(args) -> int:
 
         ok = fail = 0
         frames = 0
+        video_bytes = 0
         mf = p["out"] / "manifest.jsonl"
         if mf.exists():
             for line in mf.read_text(errors="ignore").splitlines():
@@ -299,11 +300,21 @@ def cmd_status(args) -> int:
                 if e.get("status") == "ok":
                     ok += 1
                     frames += e.get("frames") or 0
+                    # Track video separately from everything else on disk.
+                    # The budget is "MB per hour of footage" and that means
+                    # the video: counting inputs.csv, the ffmpeg/wine logs and
+                    # the .work staging directory inflated a real 599 MB/h to
+                    # a reported 879 and made the ceiling look breached.
+                    try:
+                        video_bytes += os.path.getsize(e["video"])
+                    except (KeyError, OSError):
+                        pass
                 else:
                     fail += 1
         b = _dir_bytes(p["out"])
         rows.append((i, pid, "running" if alive else "stopped", ok, fail,
                      b / 1e9, frames / 60 / 3600))
+        total_video += video_bytes
         total_ok += ok
         total_fail += fail
         total_bytes += b
@@ -320,9 +331,12 @@ def cmd_status(args) -> int:
 
     hours = total_frames / 60 / 3600
     print(f"\ntotal: {total_ok} ok, {total_fail} failed, "
-          f"{total_bytes / 1e9:.1f} GB, {hours:.2f} hours of footage")
+          f"{total_bytes / 1e9:.1f} GB on disk, {hours:.2f} hours of footage")
     if hours > 0:
-        print(f"rate : {total_bytes / 1e6 / hours:.0f} MB per hour of footage")
+        rate = total_video / 1e6 / hours
+        budget = encode.MB_PER_HOUR_BUDGET
+        print(f"video: {total_video / 1e9:.1f} GB -> {rate:.0f} MB per hour of "
+              f"footage ({'OK' if rate <= budget else 'OVER'}, budget {budget})")
     running = sum(1 for r in rows if r[2] == "running")
     print(f"alive: {running}/{len(rows)} workers")
     return 0
