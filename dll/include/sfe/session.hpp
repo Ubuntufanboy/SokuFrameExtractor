@@ -33,15 +33,18 @@
 //
 // STARTING THE REPLAY
 // -------------------
-// No menu navigation and no synthetic input at all.  The session calls the
-// game's own InputManager::readReplay() to load the .rep, then changeScene()
-// to jump straight to playback.
+// No menu navigation and no synthetic input at all.  The session hooks the
+// current scene's onProcess() -- the one function the engine asks "which
+// scene next?" -- and from inside it runs exactly what the replay menu's
+// confirm handler runs: InputManager::readReplay(), then setBattleMode() with
+// the mode the .rep header declares, then return SCENE_LOADING.
 //
-// Driving the menus was tried first and does not work headlessly: Soku reads
-// the keyboard through DirectInput, and Wine's dinput reads raw X11/evdev
-// state rather than the synthetic Win32 input queue, so SendInput,
-// SendInput+SetFocus, PostMessage(WM_KEYDOWN) and xdotool were all swallowed
-// -- the game rendered its title screen while the scene id never moved.
+// Driving the menus was tried first and cannot work headlessly: Soku reads
+// the keyboard through DirectInput, and Wine's dinput reads real evdev
+// devices rather than the synthetic Win32 input queue, so SendInput,
+// SendInput+SetFocus, PostMessage(WM_KEYDOWN), xdotool/XTEST and a uinput
+// virtual keyboard were all swallowed -- the game rendered its title screen
+// while the scene id never moved.
 //
 // Calling the game directly is better than a working keypress would have
 // been: there is no key timing to calibrate, no menu layout to assume, and a
@@ -112,15 +115,13 @@ private:
     int      m_frame_index   = 0;   // engine ticks captured so far
     uint32_t m_start_tick    = 0;   // GetTickCount at session start
     uint32_t m_state_tick    = 0;   // GetTickCount at last transition
-    int      m_nav_step      = 0;
     uint32_t m_state_tick_logged = 0;  // throttles START_REPLAY scene logging
-
+    int      m_last_scene_logged = -1; // so each scene change is logged once
 
     bool m_hooks_installed = false;
     bool m_vtable_hooked   = false;
-    bool m_checkkey_hooked = false;
-    bool m_nav_armed       = false;
-    uint8_t m_checkkey_saved[5] = {};
+    bool m_scene_hooked    = false;
+    bool m_start_armed     = false;
     bool m_capturing       = false;
     bool m_encoder_started = false;
 

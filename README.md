@@ -61,6 +61,11 @@ Input bits: `0x001` up, `0x002` down, `0x004` left, `0x008` right, `0x010` A
 Directory names are keyed on the source `.rep`'s content hash, so every capture
 is attributable to the exact file that produced it.
 
+Budget roughly **100 MB per replay** at the default `--crf 23` — a measured
+5-minute match came to 118 MB for 18,144 frames. The whole 397-replay corpus is
+therefore tens of GB, not the few GB a smaller sample suggests; raise `--crf`
+if that matters more than fidelity does.
+
 ---
 
 ## Status
@@ -77,21 +82,66 @@ is attributable to the exact file that produced it.
 - One replay per game process, with machine-readable status and a real exit
   code.
 - Headless rendering under Xvfb + Mesa llvmpipe (verified by screenshot).
-
+- **Unattended replay start** — no menus, no keypresses, no human. See below.
+- Corpus fan-out across containers: `--shard I/N` splits the replay list into
+  disjoint, complete strides.
 - Recovery of legacy BMP captures into the modern layout
   (`pipeline/from_bmp.py`), and the showcase clip above, built from real
   recorded gameplay.
 
-**Not working: automated menu navigation**
+**Working: starting a replay with no menus and no keypresses**
 
-Capture is proven; *starting* a replay without a human is not. The module
-cannot drive the game's menus, so every capture so far — including the
-showcase above — came from a person pressing the keys while the extractor
-recorded.
+The module does what the buttons do, instead of pressing them. Read off
+`th123.exe`, the replay list's confirm handler (`0x0044B3D0`) and the menu
+scene's scene-6 case (`0x00427786`) are together just:
 
-Soku reads the keyboard through DirectInput, and under Wine nothing
-synthetic reaches it. Seven approaches were tried and all fail identically:
-the game renders normally and the scene id never moves.
+```c
+readReplay(path)                                  // 0x0042EAC0, this = 0x00898718
+mode = *(uint8_t *)(0x00898718 + 0xEC)            // battle mode from the .rep header
+setBattleMode(mode == 0 ? 0 : mode == 7 ? 7 : 3, 2)   // 0x0043E9A0
+return SCENE_LOADING                              // 6
+```
+
+That has to run **inside a hook on the current scene's `onProcess`** (vtable
+slot 1), because the engine's main loop asks for the next scene by calling it:
+
+```c
+if (sceneId == newSceneId) {                          // 0x8A0044 vs 0x8A0040
+    newSceneId = scene->onProcess();                  // scene object at 0x8A000C
+    if (newSceneId != sceneId) CreateThread(loadGraphics);
+} else if (!loadingScreen->isBusy()) commitSceneSwap();
+```
+
+Same thread, same call site, same return path a keypress would have taken.
+`readReplay` returning false means the game itself rejected the file, which is
+a much better error than "navigation failed".
+
+Two things had to be right, and both had already cost a day when they were
+guessed at instead:
+
+- **`setBattleMode` is not two byte stores.** It initialises about twenty
+  globals, one of which (`0x00899D08`) is the *argument* to the battle worker
+  task that used to fault at `0x004386A6`. Writing `mainMode`/`subMode` by hand
+  and leaving the rest stale is exactly what the battle creator crashed on.
+- **`setBattleMode` faults in a container with no input devices.** It does
+  `deviceProfiles.at(selectedDevice)`; `deviceProfiles` (`0x00899CEC`) is built
+  by enumerating DirectInput devices, and the checked `.at()` raises
+  `0xC000000D` when the index is past the end. A container has no
+  `/dev/input`, so the vector is **empty** and `.at(0)` kills the process. The
+  module sets the selector to the game's own "no device" value (`-2`) when, and
+  only when, the index would be out of range — replay inputs come from the
+  `.rep` stream, so no device is ever read.
+
+That second one is the same root cause as the input problem below, surfacing
+somewhere else entirely: not "keys do not arrive" but "the device list is
+empty".
+
+**Not working, and no longer needed: synthetic keyboard input**
+
+Soku reads the keyboard through DirectInput and under Wine nothing synthetic
+reaches it. Seven approaches were tried and all failed identically — the game
+renders normally and the scene id never moves. None of them are on the path
+any more; the table is kept so nobody spends another day on it.
 
 | approach | layer | result |
 |---|---|---|
@@ -103,22 +153,15 @@ the game renders normally and the scene id never moves.
 | `/dev/uinput` virtual keyboard | kernel | device is global — types into the host's desktop; unavailable in an unprivileged container |
 | hooking `checkKeyOneshot` (`0x0043DE30`) | game code | hook installs, but the game never calls it — 0 invocations logged |
 
-Starting a replay *without* the menus gets further but also fails:
-`InputManager::readReplay` (`0x0042EAC0`) succeeds and
-`changeScene(SCENE_LOADING)` really does change the scene, but the game then
-faults at `0x4386a6` — `mov eax,[ecx]` where `ecx` is the still-null
-BattleManager at `0x008985E4`. It reproduces with this module's vtable hook
-disabled, so it is missing game setup rather than interference from us.
-
-Unblocking this needs either the rest of the replay-menu start sequence
-reverse-engineered, or a real Windows environment where DirectInput behaves
-normally.
+The root cause is that Wine's dinput reads real evdev devices. Every approach
+above injects above the kernel, so dinput never sees any of it.
 
 **Not built yet**
 
 - `.npz` shard export for the training repo.
 - Validated matchup metadata — see `pipeline/REPPARSE_STATUS.md`.
-- Unattended collection at corpus scale (blocked on the above).
+- A full 397-replay corpus run. The mechanism works and shards across
+  containers; it has not yet been run end to end at that scale.
 
 ---
 
@@ -150,6 +193,36 @@ python3 -m pipeline.overlay out/<capture>/
 # 5. Build the showcase reel
 python3 -m pipeline.trailer out/ -o docs/assets/showcase.mp4
 ```
+
+### Fanning a corpus out across containers
+
+`--shard I/N` gives each container a disjoint slice of the corpus. The split is
+a pure function of the sorted replay list, so the containers need no
+coordination and never collide:
+
+```bash
+# 20 replays, 10 containers -> 2 each
+for i in $(seq 0 9); do
+  docker run -d --cpus 2 --memory 4g \
+    -v "$HOME/.wine-soku:/prefix:ro" -v "$PWD/out/shard$i:/out" \
+    sfe-collect --prefix /prefix --out /out --shard "$i/10"
+done
+```
+
+Each container plays its replays one at a time, one game process each, and
+writes a `video.mp4` + `inputs.csv` pair per replay. Merge the shards by
+concatenating their `manifest.jsonl` files; capture directories are keyed on
+the source `.rep`'s content hash, so names cannot collide.
+
+Slices are **strided, not contiguous**: replays sort by filename and therefore
+cluster by date and matchup, so a contiguous block would hand one container a
+whole tournament. Striding gives every shard the same mix, which matters
+because a partial corpus is the normal outcome of a fan-out run.
+
+One Wine prefix serves one container. Give each its own prefix volume, or
+mount a shared one read-only — `runner/collect.py` takes an exclusive `flock`
+on the prefix and refuses to start a second collector against it, because two
+collectors sharing a wineserver silently produce garbage rather than an error.
 
 ### Recovering older BMP-era captures
 
@@ -326,38 +399,28 @@ the new thread's `DLL_THREAD_ATTACH` needs the lock you are holding, and the
 game crashes during module load. `VideoEncoder::start()` is deliberately
 deferred to the first `onFrame()`, on the game thread.
 
-### Synthetic keyboard input does not reach the game under Wine
+### Synthetic keyboard input does not reach the game under Wine (worked around)
 
-Soku reads the keyboard through DirectInput, and Wine's dinput reads key state
-from the X server rather than from Wine's synthetic Win32 input queue. Every
-in-process injection mechanism is therefore swallowed: the game renders its
-title screen normally and the scene id never moves.
+Soku reads the keyboard through DirectInput, and **Wine's dinput reads real
+evdev devices under `/dev/input`** — not Wine's synthetic Win32 input queue,
+and not the X server's synthetic events. Everything that injects above the
+kernel is therefore invisible to it, on a desktop or in a container. See
+[Status](#status) for the full table of what was tried.
 
-Confirmed not working, each tested in the container with the mod loader active:
+This also explains why a container is strictly *worse* than a desktop rather
+than merely equal: a container has no `/dev/input` at all, so dinput has no
+keyboard to enumerate under any circumstances.
 
-| approach | result |
-|---|---|
-| `SendInput` | swallowed |
-| `SendInput` + `SetForegroundWindow`/`SetFocus` | swallowed |
-| `PostMessage(WM_KEYDOWN/WM_KEYUP)` | swallowed |
-| `SendInput` + a real window manager (openbox) for focus | swallowed |
-| writing `KeymapManager.inKeys` directly | crashed (offsets unverified) |
+Two consequences, both handled:
 
-Menu navigation therefore lives in `runner/menu.py`, outside the game, driving
-it through **XTEST** (`xdotool`) so the X server generates the key events by
-the same path a physical keyboard would.
+- Menu navigation is gone. The module calls what the menu handler calls
+  instead — see [Status](#status).
+- `setBattleMode` indexes the (empty) DirectInput device list and crashes.
+  `session.cpp` selects the game's own "no device" profile when the index
+  would be out of range.
 
-### Starting a replay without the menus does not work either
-
-`InputManager::readReplay(path)` (`0x0042EAC0`) succeeds and
-`changeScene(SCENE_LOADING)` really does move the scene, but the game then
-faults at `0x4386a6` -- `mov eax,[ecx]` where `ecx` is the BattleManager global
-at `0x008985E4`, still null. Setting `mainMode`/`subMode` to
-`VSPLAYER`/`REPLAY` does not prevent it, and it reproduces with this module's
-vtable hook disabled, so it is missing game setup rather than interference from
-us. The replay menu evidently applies more state (characters/stage from the
-replay header) before switching scene. The code is kept in `session.cpp` for
-whoever picks this up.
+`runner/menu.py` and `runner/vkbd.py` are kept as documented dead ends, not as
+part of the pipeline. Nothing calls them.
 
 ### Xvfb rejects depth 32
 

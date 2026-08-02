@@ -274,6 +274,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--work", type=Path, default=None,
                     help="scratch dir for FIFO/staging (default: <out>/.work)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N replays")
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                    help="capture only shard I of N (0-based), for fanning the "
+                         "corpus out across containers")
     ap.add_argument("--jobs", type=int, default=1,
                     help="concurrent replays (default 1; >1 needs one prefix each)")
     ap.add_argument("--cpus", type=int, default=throttle.default_cpu_count(),
@@ -334,6 +337,27 @@ def main(argv: list[str] | None = None) -> int:
     if not replays:
         print(f"error: no .rep files under {replay_dir}", file=sys.stderr)
         return 2
+
+    if args.shard:
+        try:
+            idx, total = (int(x) for x in args.shard.split("/", 1))
+        except ValueError:
+            print(f"error: --shard wants I/N, got {args.shard!r}", file=sys.stderr)
+            return 2
+        if total < 1 or not (0 <= idx < total):
+            print(f"error: --shard {args.shard} is out of range", file=sys.stderr)
+            return 2
+        # Stride, not contiguous blocks. find_replays() sorts by path, so
+        # contiguous blocks would hand one container a whole directory -- and
+        # replays cluster by date and matchup, so a block is far from a random
+        # sample. Striding gives every shard the same mix, which matters
+        # because a partial corpus is the normal outcome of a fan-out run.
+        #
+        # The split is a pure function of the sorted corpus, so shards are
+        # disjoint and complete without the containers talking to each other.
+        before = len(replays)
+        replays = replays[idx::total]
+        print(f"shard {idx}/{total}: {len(replays)} of {before} replays")
 
     if args.resume:
         done = manifest.completed_ids(args.out)

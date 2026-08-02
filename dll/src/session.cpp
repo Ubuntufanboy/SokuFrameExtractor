@@ -41,6 +41,43 @@ static inline int currentScene() {
     return *reinterpret_cast<volatile int*>(ADDR_SCENE_ID);
 }
 
+// =========================================================================
+// The scene machine
+// =========================================================================
+// Read off the main loop at 0x00407F11..0x00407F9D.  The application object
+// lives at 0x0089FF90 and the loop is, in full:
+//
+//     if (app->sceneId == app->newSceneId) {          // 0x8A0044 vs 0x8A0040
+//         app->newSceneId = app->scene->onProcess();  // vtable slot 1
+//         if (app->newSceneId != app->sceneId)
+//             CreateThread(loadGraphics);             // 0x00408410
+//     } else if (!app->loadingScreen->isBusy()) {
+//         commitSceneSwap();                          // 0x00407C50
+//     }
+//
+// Three facts matter, and all three are why the earlier bypass crashed:
+//
+//   1. A scene change is *requested by returning the new scene id from
+//      onProcess*.  Nothing else is a supported way to ask.
+//   2. The engine starts the loader thread itself, but only on the tick where
+//      onProcess returned a different id.  Poking newSceneId from outside that
+//      window means the engine never starts the loader (so we had to spawn it
+//      by hand, racing the engine) *and* the title screen's own onProcess
+//      overwrites the value on the very next tick.
+//   3. onProcess runs on the game's main thread at a defined point in the
+//      loop.  Anything that mutates battle state has to happen there.
+//
+// So the bypass hooks vtable slot 1 of whatever scene is current, and returns
+// the scene id we want from inside it.  That is byte-for-byte what pressing
+// the button in the menu would have done -- same thread, same call site, same
+// return path -- with the menu's own handler code inlined into the hook.
+constexpr DWORD ADDR_SCENE_OBJECT = 0x008A000C;  // app->scene   (app + 0x7C)
+constexpr int   VTBL_SCENE_ONPROCESS = 1;        // int __thiscall onProcess()
+
+static inline void* currentSceneObject() {
+    return *reinterpret_cast<void* volatile*>(ADDR_SCENE_OBJECT);
+}
+
 // Create a directory and any missing parents, Win32 only.
 static bool makeDirs(const char* path) {
     char buf[SFE_PATH_MAX];
@@ -98,276 +135,235 @@ constexpr uint32_t MS_DRAIN          = 1500;   // post-match settle before stop
 constexpr uint32_t MS_FIFO_DEADLINE  = 60000;  // wait for FFmpeg to attach
 
 // =========================================================================
-// Driving the menus by hooking the game's own key check
+// Starting a replay without touching the menus
 // =========================================================================
-// This is how menu navigation actually happens. Every attempt to deliver a
-// keystroke from outside failed, because Soku reads the keyboard through
-// DirectInput and Wine's dinput does not see synthetic input:
+// No synthetic input anywhere.  Every attempt to deliver a keystroke failed,
+// because Soku reads the keyboard through DirectInput and Wine's dinput reads
+// real evdev devices -- not Wine's synthetic Win32 queue, and not the X
+// server's synthetic events.  SendInput, SendInput+SetFocus, SendInput with a
+// window manager, PostMessage(WM_KEYDOWN), xdotool/XTEST and a /dev/uinput
+// virtual keyboard were all tried; the game rendered its title screen happily
+// while the scene id never moved.  Hooking the game's own checkKeyOneshot()
+// (0x0043DE30) did not help either: it was never called once.
 //
-//   SendInput / +focus / +window manager .... swallowed
-//   PostMessage(WM_KEYDOWN)  ................ swallowed
-//   xdotool (XTEST, X server level) ......... swallowed
-//   /dev/uinput virtual keyboard ............ works at the kernel level, but
-//       the device is global to the machine -- it types into the host's
-//       desktop, and an unprivileged container has no /dev/uinput at all.
+// So do not press the button.  Do what the button does.
 //
-// So stop trying to synthesise input and intercept the question instead.
-// checkKeyOneshot(dik, ...) is what the menus call to ask "was this key just
-// pressed?". Returning true once is exactly a single press -- "oneshot" is
-// already the semantics we want, so there is no key-repeat or hold duration
-// to tune, and nothing below the game to fight.
+// The replay list's confirm handler is at 0x0044B3D0 and is short:
 //
-// The hook is the same 5-byte JMP trampoline used for wglSwapBuffers, which
-// is already proven to work in this process.
-constexpr DWORD ADDR_CHECK_KEY_ONESHOT = 0x0043DE30;
+//     sprintf(path, "%s/%s", dir, filename);          // 0x00858370 = "%s/%s"
+//     if (!getInputManager()->readReplay(path))       // 0x0042EAC0
+//         return;                                     //   bad .rep, stay put
+//     playSound(0x28);
+//     g_requestedScene = SCENE_LOADING;               // 0x00882A94 = 6
+//
+// and the menu scene's onProcess then translates that request (0x004276D0,
+// case 6 at 0x00427786) into the actual transition:
+//
+//     mode = getInputManager()->replayBattleMode;     // this + 0xEC
+//     setBattleMode(mode == 0 ? 0 : mode == 7 ? 7 : 3, 2);   // 0x0043E9A0
+//     return SCENE_LOADING;
+//
+// Both halves are reproduced below, in that order, inside a hook on the
+// current scene's onProcess.
+//
+// WHY THE PREVIOUS ATTEMPT CRASHED
+// --------------------------------
+// It called readReplay(), wrote mainMode/subMode as two loose bytes, poked
+// newSceneId from the render thread and spawned the loader thread by hand.
+// The game reached the loading screen and then faulted at 0x004386A6 --
+// `mov ecx,[0x008985E4]; mov eax,[ecx]` with the BattleManager still null.
+//
+// Two separate reasons, both visible in the disassembly:
+//
+//   * setBattleMode is not two byte stores.  It initialises about twenty
+//     globals -- 0x00899D08 (which is handed to the battle worker task that
+//     faulted, as its argument), 0x00899D0C/10/30/54..59, 0x00898678..90,
+//     and 0x00899CEC.  Writing two of them and leaving the rest stale is what
+//     the battle creator then walked into.
+//   * The scene request has to come back from onProcess.  Written from
+//     outside, the title screen's own onProcess overwrote it on the next tick,
+//     and the engine's loader-thread launch (which only runs on the tick where
+//     onProcess changed the id) never fired -- hence the hand-rolled thread,
+//     racing whatever value newSceneId happened to hold when it read it.
+//
+// Doing it from inside onProcess removes both: same thread, same call site,
+// same return path the menu would have used, with the game's own setup
+// function doing the setup.
+constexpr DWORD ADDR_INPUT_MANAGER     = 0x00898718;  // SokuLib inputMgr
+constexpr DWORD ADDR_READ_REPLAY       = 0x0042EAC0;  // InputManager::readReplay
+constexpr DWORD ADDR_SET_BATTLE_MODE   = 0x0043E9A0;  // setBattleMode(main, sub)
 
-// DirectInput scancodes for the keys Soku's menus use.
-constexpr int DIK_RETURN = 0x1C;
-constexpr int DIK_Z      = 0x2C;
-constexpr int DIK_UP     = 0xC8;
-constexpr int DIK_DOWN   = 0xD0;
+// -------------------------------------------------------------------------
+// The input-device list, and why setBattleMode trips over it in a container
+// -------------------------------------------------------------------------
+// setBattleMode picks the input profile for the local player:
+//
+//     sel = inputMgrCluster->selectedDevice;      // 0x0040A8E0: [ecx + 0x74]
+//     g_profile = (sel < 0) ? &defaultProfile     // 0x008986A8
+//                           : deviceProfiles.at(sel);
+//
+// deviceProfiles (0x00899CEC) is a std::vector of 0x68-byte entries built by
+// enumerating DirectInput devices (0x00442CC5), and .at() is the checked
+// accessor -- 0x0043E3B0 calls the CRT's invalid-argument handler, which
+// raises 0xC000000D, if the index is past the end.
+//
+// In a container there are no input devices at all: no /dev/input, so Wine's
+// dinput enumerates nothing and the vector is empty.  The selector is still
+// 0 ("first device"), so .at(0) on an empty vector kills the process.  That
+// is the same root cause that makes every synthetic-keystroke approach fail,
+// surfacing somewhere completely different -- not "keys do not arrive" but
+// "the device list is empty".
+//
+// The game already has the answer in its own code: a negative selector means
+// "no device, use the default profile".  For replay playback that is exactly
+// right, because both players' inputs come from the .rep stream and no device
+// is ever read.  So when -- and only when -- the index would be out of range,
+// set the selector negative first.  On a machine with real input devices this
+// changes nothing.
+constexpr DWORD ADDR_INPUT_CLUSTER      = 0x0089A248;  // SokuLib inputMgrs
+constexpr int   CLUSTER_SELECTED_DEVICE = 0x74;        // signed char
+constexpr DWORD ADDR_DEVICE_PROFILES    = 0x00899CEC;  // std::vector<Profile>
+constexpr int   DEVICE_PROFILE_SIZE     = 0x68;
+constexpr signed char NO_INPUT_DEVICE   = -2;          // the game's own 0xFE
 
-using PFN_checkKeyOneshot = int (__cdecl*)(int, int, int, int);
-static PFN_checkKeyOneshot s_origCheckKey = nullptr;
-
-// Set to a DIK code to report that key as "just pressed" exactly once.
-// volatile: written by the FSM on the game thread, read inside the hook.
-static volatile int s_inject_dik = 0;
-
-// Diagnostic: record the argument tuples the game actually passes, so the
-// meaning of the parameters can be read off a real run instead of assumed.
-// The first argument was taken to be a DirectInput scancode; that assumption
-// is what this exists to check.
-static volatile int  s_log_calls = 40;  // log the first 40 distinct tuples, whenever they occur
-static int s_seen[32][4] = {};
-static int s_seen_n = 0;
-
-static int __cdecl HookedCheckKeyOneshot(int a, int b, int c, int d) {
-    if (s_log_calls > 0) {
-        bool dup = false;
-        for (int i = 0; i < s_seen_n; ++i)
-            if (s_seen[i][0]==a && s_seen[i][1]==b && s_seen[i][2]==c && s_seen[i][3]==d)
-                { dup = true; break; }
-        if (!dup && s_seen_n < 32) {
-            s_seen[s_seen_n][0]=a; s_seen[s_seen_n][1]=b;
-            s_seen[s_seen_n][2]=c; s_seen[s_seen_n][3]=d;
-            ++s_seen_n;
-            sfe::log("checkKey call: (%d, %d, %d, %d)  [0x%X]", a, b, c, d, a);
-            --s_log_calls;
-        }
-    }
-    if (s_inject_dik != 0 && a == s_inject_dik) {
-        s_inject_dik = 0;   // consume: one press, one report
-        return 1;
-    }
-    return s_origCheckKey ? s_origCheckKey(a, b, c, d) : 0;
+// Number of enumerated input devices, read the way .at() reads it.
+static int deviceProfileCount() {
+    auto* v = reinterpret_cast<DWORD volatile*>(ADDR_DEVICE_PROFILES);
+    const DWORD first = v[1], last = v[2];
+    if (!first || last < first) return 0;
+    return static_cast<int>((last - first) / DEVICE_PROFILE_SIZE);
 }
 
-// Patch a 5-byte relative JMP over `target`, returning a callable trampoline
-// for the original. Same technique as OGLHook::install.
-static void* installJmpHook(void* target, void* replacement, uint8_t saved[5]) {
-    memcpy(saved, target, 5);
+// Returns true if it had to intervene.
+static bool guardInputDeviceSelector() {
+    auto* sel = reinterpret_cast<volatile signed char*>(ADDR_INPUT_CLUSTER
+                                                        + CLUSTER_SELECTED_DEVICE);
+    const int count = deviceProfileCount();
+    const int want  = *sel;
 
-    uint8_t patch[5] = { 0xE9, 0, 0, 0, 0 };
-    const intptr_t rel = reinterpret_cast<intptr_t>(replacement)
-                       - reinterpret_cast<intptr_t>(target) - 5;
-    memcpy(patch + 1, &rel, 4);
+    sfe::log("Input devices: %d enumerated, selector=%d", count, want);
+    if (want < 0 || want < count) return false;   // the game's own path is safe
+
+    *sel = NO_INPUT_DEVICE;
+    sfe::log("No usable input device (%d enumerated, selector was %d) — "
+             "selecting the default profile so setBattleMode cannot fault. "
+             "Replay inputs come from the .rep, so no device is read.",
+             count, want);
+    return true;
+}
+
+// Battle mode recorded in the .rep header, as readReplay() decoded it.  The
+// game branches on this to pick mainMode, because a story-mode replay and a
+// versus replay need different battle setups.
+constexpr int IM_REPLAY_MODE_OFFSET = 0xEC;
+
+constexpr int BATTLE_SUBMODE_REPLAY = 2;
+
+using PFN_readReplay    = bool (__thiscall*)(void* self, const char* path);
+using PFN_setBattleMode = void (__cdecl*)(int mainMode, int subMode);
+
+// onProcess is __thiscall with no arguments, which MSVC cannot spell for a
+// free function.  __fastcall is the same thing with EDX additionally live:
+// ECX carries `this`, no arguments touch the stack, and the callee cleans
+// nothing -- so a plain `ret` on both sides matches.
+using PFN_sceneProcess = int (__fastcall*)(void* self, void* edx);
+
+static PFN_sceneProcess s_orig_scene_process = nullptr;
+static DWORD*           s_scene_vtbl         = nullptr;
+
+// Set up by the FSM before the hook is armed, read inside it.
+static char s_replay_path[SFE_PATH_MAX] = {};
+
+// Hook <-> FSM handshake.  Both sides run on the game thread in practice, but
+// the OGL hook is only *believed* to share it, so treat these as cross-thread.
+static volatile LONG s_start_request = 0;  // 1: do the start on the next tick
+static volatile LONG s_start_done    = 0;  // 1: ok, -1: the game rejected the .rep
+static volatile LONG s_start_mode    = -1; // mainMode the game picked, for the log
+
+// The hook.  Runs on the game's main thread from 0x00407F43.
+static int __fastcall HookedSceneProcess(void* This, void* edx) {
+    if (InterlockedCompareExchange(&s_start_request, 0, 1) == 1) {
+        auto readReplay = reinterpret_cast<PFN_readReplay>(ADDR_READ_REPLAY);
+        void* mgr = reinterpret_cast<void*>(ADDR_INPUT_MANAGER);
+
+        if (!readReplay(mgr, s_replay_path)) {
+            // The game itself says this file is not loadable.  Report it as
+            // such rather than letting it look like a navigation failure --
+            // that distinction was impossible to make with keypresses.
+            InterlockedExchange(&s_start_done, -1);
+            return s_orig_scene_process(This, edx);
+        }
+
+        guardInputDeviceSelector();
+
+        const unsigned char rep_mode =
+            *reinterpret_cast<volatile unsigned char*>(ADDR_INPUT_MANAGER
+                                                       + IM_REPLAY_MODE_OFFSET);
+        const int main_mode = (rep_mode == 0) ? 0 : (rep_mode == 7 ? 7 : 3);
+
+        reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(
+            main_mode, BATTLE_SUBMODE_REPLAY);
+
+        InterlockedExchange(&s_start_mode, main_mode);
+        InterlockedExchange(&s_start_done, 1);
+        return SCENE_LOADING;
+    }
+    return s_orig_scene_process(This, edx);
+}
+
+// Patch slot 1 of the *current* scene's vtable.  The scene object is a
+// singleton of its class while it is current, and the vtable is restored on
+// shutdown, so nothing outlives the module.
+static bool installSceneHook() {
+    void* scene = currentSceneObject();
+    if (!scene) {
+        sfe::log("ERROR: no current scene object at 0x%08lX", ADDR_SCENE_OBJECT);
+        return false;
+    }
+
+    DWORD* vtbl = *reinterpret_cast<DWORD**>(scene);
+    if (!vtbl) {
+        sfe::log("ERROR: scene %p has a null vtable", scene);
+        return false;
+    }
 
     DWORD oldProt = 0;
-    if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProt)) return nullptr;
-    memcpy(target, patch, 5);
-    VirtualProtect(target, 5, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), target, 5);
+    // PAGE_READWRITE, not PAGE_WRITECOPY -- the latter silently fails on
+    // .rdata under Wine and leaves the patch unapplied (see the BattleManager
+    // vtable hook, which hit exactly that).
+    if (!VirtualProtect(vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        sfe::log("ERROR: VirtualProtect on scene vtable %p failed (GLE=%lu)",
+                 vtbl, GetLastError());
+        return false;
+    }
 
-    void* tramp = VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE,
-                               PAGE_EXECUTE_READWRITE);
-    if (!tramp) return nullptr;
-    auto* tb = static_cast<uint8_t*>(tramp);
-    memcpy(tb, saved, 5);
-    tb[5] = 0xE9;
-    const intptr_t back = reinterpret_cast<intptr_t>(target) + 5
-                        - reinterpret_cast<intptr_t>(tb + 5) - 5;
-    memcpy(tb + 6, &back, 4);
-    FlushInstructionCache(GetCurrentProcess(), tramp, 16);
+    s_scene_vtbl         = vtbl;
+    s_orig_scene_process = reinterpret_cast<PFN_sceneProcess>(
+                               vtbl[VTBL_SCENE_ONPROCESS]);
+    vtbl[VTBL_SCENE_ONPROCESS] = reinterpret_cast<DWORD>(HookedSceneProcess);
 
     DWORD tmp = 0;
-    VirtualProtect(tramp, 16, PAGE_EXECUTE_READ, &tmp);
-    return tramp;
+    VirtualProtect(vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+
+    sfe::log("Scene onProcess hooked: scene=%p vtbl=%p orig=%p",
+             scene, vtbl, reinterpret_cast<void*>(s_orig_scene_process));
+    return true;
 }
 
-// =========================================================================
-// Navigation script
-// =========================================================================
-// Empirical, and the one part of this file that cannot be derived from
-// anything observable: while the main menu is open the scene id stays
-// SCENE_TITLE, so there is no state to poll between these presses.
-//
-// Exactly one .rep is staged in the replay directory, so the replay list has a
-// single entry and the cursor already sits on it -- no scrolling, nothing to
-// drift.  The old script pressed DOWN twice to reach "list position 2" of a
-// 397-entry list, which is precisely the fragility this design removes.
-//
-// What IS verified is the outcome: reaching the battle is confirmed against
-// SokuLib::sceneId, and failure to do so within MS_BATTLE_DEADLINE ends the
-// process cleanly instead of retrying into an unknown menu.
-template<typename T, int N>
-static constexpr int countof(const T (&)[N]) { return N; }
-
-// -------------------------------------------------------------------------
-// Menu navigation by synthesised keypress
-// -------------------------------------------------------------------------
-// Used because the programmatic start (loadReplayFile + changeScene) faults
-// inside the game's own battle creation: forcing SCENE_LOADING skips setup
-// that the replay menu performs, leaving the BattleManager global at
-// 0x008985E4 null when a thunk at 0x4386a6 dereferences it. Verified not to be
-// our vtable hook -- it crashes identically with the hook disabled.
-//
-// SendInput needs a focused window, which bare Xvfb never provides; the runner
-// now starts a window manager for exactly this reason.
-struct NavStep {
-    uint32_t delay_ms;  // settle time before this step
-    int      dik;       // DirectInput scancode to report as pressed
-};
-
-static const NavStep k_nav[] = {
-    { 1200, DIK_Z    },  // title -> main menu
-    {  800, DIK_UP   },  // wrap upward to "Watch Replay"
-    {  250, DIK_UP   },
-    {  250, DIK_UP   },
-    {  250, DIK_UP   },
-    {  250, DIK_UP   },
-    {  250, DIK_UP   },
-    {  600, DIK_Z    },  // enter Watch Replay
-    {  900, DIK_Z    },  // confirm / open the replay list
-    {  900, DIK_Z    },  // select the single staged entry
-    {  600, DIK_Z    },  // start playback
-};
-
-// The game's main window; must not match the 1x1 IME/helper windows.
-static HWND gameWindow() {
-    static HWND s_hwnd = nullptr;
-    if (s_hwnd && IsWindow(s_hwnd)) return s_hwnd;
-    s_hwnd = nullptr;
-    const DWORD self = GetCurrentProcessId();
-    for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT)) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid != self) continue;
-        RECT r{};
-        if (!GetClientRect(h, &r)) continue;
-        if ((r.right - r.left) < GAME_WIDTH || (r.bottom - r.top) < GAME_HEIGHT)
-            continue;
-        s_hwnd = h;
-        break;
+static void restoreSceneHook() {
+    if (!s_scene_vtbl || !s_orig_scene_process) return;
+    DWORD oldProt = 0;
+    if (VirtualProtect(s_scene_vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        s_scene_vtbl[VTBL_SCENE_ONPROCESS] =
+            reinterpret_cast<DWORD>(s_orig_scene_process);
+        DWORD tmp = 0;
+        VirtualProtect(s_scene_vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+        sfe::log("Scene onProcess restored");
     }
-    return s_hwnd;
-}
-
-static void pressKey(BYTE vk) {
-    if (HWND h = gameWindow()) {
-        SetForegroundWindow(h);
-        SetActiveWindow(h);
-        SetFocus(h);
-    }
-    INPUT in[2] = {};
-    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = vk;
-    in[1].type = INPUT_KEYBOARD; in[1].ki.wVk = vk;
-    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, in, sizeof(INPUT));
-}
-
-// =========================================================================
-// Key injection
-// =========================================================================
-// SendInput updates the global key state that DirectInput polls.  External
-// X11 injection (xdotool) does NOT reach the game -- verified under Xvfb --
-// which is why this has to happen in-process.
-// =========================================================================
-// Starting a replay programmatically
-// =========================================================================
-// The game is driven directly instead of by synthesising keypresses.
-//
-// Every synthetic-input approach failed under Xvfb, because Soku reads the
-// keyboard through DirectInput and Wine's dinput reads raw X11/evdev state
-// rather than the synthetic Win32 queue. Tried and confirmed dead:
-// SendInput; SendInput plus SetForegroundWindow/SetFocus; PostMessage of
-// WM_KEYDOWN/WM_KEYUP straight to the window; and xdotool from outside the
-// process. In every case the game rendered its title screen happily while the
-// scene id sat at SCENE_TITLE until the deadline.
-//
-// The game exposes exactly what we need:
-//
-//   InputManager::readReplay(path)   loads a .rep into the input manager
-//   changeScene(SCENE_LOADING)       sets newSceneId and kicks the loader
-//
-// which is how the replay menu starts playback once you have chosen a file.
-// Calling them directly skips the menus altogether. That removes the entire
-// navigation script, the timing guesses in it, and the whole class of "a
-// keypress landed in the wrong menu" failure -- the replay either loads or it
-// does not, and we find out immediately.
-//
-// All addresses are from SokuLib's SokuAddresses.hpp for v1.10a, which
-// main.cpp's PE-header check has already confirmed.
-constexpr DWORD ADDR_COMM_MODE              = 0x00898690;  // SokuLib mainMode
-constexpr DWORD ADDR_SUB_MODE               = 0x00898688;  // SokuLib subMode
-constexpr DWORD ADDR_INPUT_MANAGER          = 0x00898718;
-constexpr DWORD ADDR_READ_REPLAY            = 0x0042EAC0;
-constexpr DWORD ADDR_SCENE_ID_NEW           = 0x008A0040;
-constexpr DWORD ADDR_LOAD_GRAPHICS_FUN      = 0x00408410;
-constexpr DWORD ADDR_LOAD_GRAPHICS_THREAD   = 0x0089FFF4;
-constexpr DWORD ADDR_LOAD_GRAPHICS_THREADID = 0x0089FFF8;
-
-// InputManager::readReplay is __thiscall: `this` in ECX, path on the stack.
-using PFN_readReplay = bool (__thiscall*)(void* self, const char* path);
-
-// SokuLib::BattleMode / BattleSubMode values.
-constexpr unsigned char BATTLE_MODE_VSPLAYER  = 3;
-constexpr unsigned char BATTLE_SUBMODE_REPLAY = 2;
-
-// Tell the game this is replay playback before loading anything.
-//
-// Without it, changeScene(SCENE_LOADING) starts the loading screen and the
-// game then faults at 0x4386a6 -- inside its own battle-creation code, right
-// next to ADDR_BATTLE_MANAGER_CREATER. The BattleManager has to know it is
-// driving from a replay stream rather than from live players; left in its
-// default mode it looks for player state a replay never sets up.
-//
-// The two mode globals are written directly rather than calling the game's
-// setBattleMode(). Calling it from here raised C000000D
-// (STATUS_INVALID_PARAMETER) -- the convention matches SokuLib's binding, but
-// we are on the render thread inside the swap hook while the game sits in the
-// title scene, which is not a context it expects to be called from. These are
-// plain byte variables (SokuLib exposes them as mainMode/subMode), so writing
-// them has no call-context requirements.
-static void setReplayBattleMode() {
-    *reinterpret_cast<volatile unsigned char*>(ADDR_COMM_MODE) = BATTLE_MODE_VSPLAYER;
-    *reinterpret_cast<volatile unsigned char*>(ADDR_SUB_MODE)  = BATTLE_SUBMODE_REPLAY;
-    sfe::log("Battle mode set: main=%d sub=%d (replay playback)",
-             BATTLE_MODE_VSPLAYER, BATTLE_SUBMODE_REPLAY);
-}
-
-// Load `path` into the game's input manager. Returns the game's own verdict,
-// so a corrupt or unreadable .rep is reported rather than silently producing
-// an empty capture.
-static bool loadReplayFile(const char* path) {
-    auto readReplay = reinterpret_cast<PFN_readReplay>(ADDR_READ_REPLAY);
-    void* mgr = reinterpret_cast<void*>(ADDR_INPUT_MANAGER);
-    return readReplay(mgr, path);
-}
-
-// SokuLib::changeScene -- request a scene and start the loader thread that
-// performs the transition.
-static void changeScene(int scene) {
-    auto* new_scene = reinterpret_cast<volatile int*>(ADDR_SCENE_ID_NEW);
-    if (currentScene() == scene) return;
-
-    *new_scene = scene;
-    HANDLE h = CreateThread(
-        nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(ADDR_LOAD_GRAPHICS_FUN),
-        nullptr, 0,
-        reinterpret_cast<LPDWORD>(ADDR_LOAD_GRAPHICS_THREADID));
-    *reinterpret_cast<volatile HANDLE*>(ADDR_LOAD_GRAPHICS_THREAD) = h;
+    s_scene_vtbl         = nullptr;
+    s_orig_scene_process = nullptr;
 }
 
 // =========================================================================
@@ -527,20 +523,10 @@ bool Session::init(const Config& cfg) {
         sfe::log("BattleManager destructor hooked");
     }
 
-    // --- key-check hook: how the menus get driven -----------------------
-    {
-        void* t = reinterpret_cast<void*>(ADDR_CHECK_KEY_ONESHOT);
-        void* tramp = installJmpHook(t, reinterpret_cast<void*>(&HookedCheckKeyOneshot),
-                                     m_checkkey_saved);
-        if (!tramp) {
-            sfe::log("ERROR: could not hook checkKeyOneshot at %p", t);
-            writeStatus("failed", "checkKeyOneshot hook failed");
-            return false;
-        }
-        s_origCheckKey = reinterpret_cast<PFN_checkKeyOneshot>(tramp);
-        m_checkkey_hooked = true;
-        sfe::log("checkKeyOneshot hooked at %p (menus driven through it)", t);
-    }
+    // The scene hook is NOT installed here.  It patches the vtable of whatever
+    // scene is current, and at Initialize() time that is the logo -- a class
+    // that gets destroyed before it would ever be asked for a scene change.
+    // WAIT_TITLE installs it once the title screen is up.
 
     if (!getOGLHook().install(m_encoder.get(), &SessionTagFn, this)) {
         sfe::log("ERROR: OGLHook::install failed — is opengl32.dll loaded?");
@@ -570,16 +556,9 @@ void Session::shutdown() {
     // function inside a DLL that was about to be unmapped, so anything that
     // destroyed a BattleManager after unload jumped into freed memory.  There
     // are 12 crash dumps in the tree consistent with that.
-    if (m_checkkey_hooked) {
-        void* t = reinterpret_cast<void*>(ADDR_CHECK_KEY_ONESHOT);
-        DWORD oldProt = 0;
-        if (VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
-            memcpy(t, m_checkkey_saved, 5);
-            VirtualProtect(t, 5, oldProt, &oldProt);
-            FlushInstructionCache(GetCurrentProcess(), t, 5);
-            sfe::log("checkKeyOneshot restored");
-        }
-        m_checkkey_hooked = false;
+    if (m_scene_hooked) {
+        restoreSceneHook();
+        m_scene_hooked = false;
     }
 
     if (m_vtable_hooked && s_origBattleDestruct) {
@@ -635,74 +614,71 @@ FrameTag Session::onFrame() {
 
     // ------------------------------------------------------------------
     case AutoState::WAIT_TITLE: {
-        // Wait for the game to actually REACH the title screen before sending
-        // any keys. This was a fixed 10 s wait, which is wrong in both
-        // directions: on fast hardware it wastes time, and under llvmpipe in a
-        // CPU-capped container the game is still on the logo (scene 0) at 10 s,
-        // so the entire navigation sequence gets fired into the opening
-        // cutscene and the replay is never started.
+        // Wait for the game to actually REACH the title screen.  Not a fixed
+        // delay: under llvmpipe in a CPU-capped container the game is still on
+        // the logo (scene 0) well past ten seconds, and the scene id is
+        // observable, so gate on it.
         //
-        // The scene id is observable, so gate on it rather than guessing.
+        // The title is where the scene hook goes in.  Earlier is not safe --
+        // the logo and opening scenes are separate objects with their own
+        // vtables, and hooking one of those would patch a class that is about
+        // to be destroyed and never asked for a scene change again.
         const int scene = currentScene();
-        if (scene == SCENE_TITLE) {
-            sfe::log("Title reached after %u ms — starting navigation", elapsedMs());
-        
-            transitionTo(AutoState::ENTER_REPLAY_MENU);
-        } else if (elapsedMs() >= MS_TITLE_DEADLINE) {
-            // Still not at the title. Proceed anyway rather than failing: some
-            // configurations skip the logo entirely, and a wrong guess here is
-            // recoverable where giving up is not.
-            sfe::log("WARNING: title not reached after %u ms (scene=%d) — "
-                     "starting navigation anyway", elapsedMs(), scene);
-            transitionTo(AutoState::ENTER_REPLAY_MENU);
+        if (scene != SCENE_TITLE) {
+            if (elapsedMs() >= MS_TITLE_DEADLINE) {
+                finish(AutoState::FAILED, "never reached the title screen");
+            }
+            break;
         }
+
+        sfe::log("Title reached after %u ms (scene=%d)", elapsedMs(), scene);
+        if (!installSceneHook()) {
+            finish(AutoState::FAILED, "could not hook the scene's onProcess");
+            break;
+        }
+        m_scene_hooked = true;
+        transitionTo(AutoState::ENTER_REPLAY_MENU);
         break;
     }
 
     // ------------------------------------------------------------------
     case AutoState::ENTER_REPLAY_MENU: {
-        // Feed one key per step through the hooked checkKeyOneshot. A step is
-        // complete once the game has actually consumed the injection
-        // (s_inject_dik back to 0), so this self-paces to the game's polling
-        // rather than guessing at timings -- the failure mode that dogged both
-        // the old frame-count script and its wall-clock replacement.
-        if (m_nav_step >= countof(k_nav)) {
-            sfe::log("Navigation sequence delivered — waiting for battle");
-            transitionTo(AutoState::START_REPLAY);
+        // Ask the hook to perform the start on the game's next logic tick,
+        // then wait for its verdict.  Nothing happens on this thread: the
+        // whole point is that readReplay() and setBattleMode() run where the
+        // game runs them.
+        if (!m_start_armed) {
+            snprintf(s_replay_path, sizeof(s_replay_path), "%s/%s",
+                     m_cfg.replay_dir, m_replay_name);
+            // The game's own sprintf format is "%s/%s" (0x00858370), so
+            // forward slashes are what readReplay() is used to seeing.  Wine
+            // accepts either, but matching the game removes a variable.
+            for (char* p = s_replay_path; *p; ++p)
+                if (*p == '\\') *p = '/';
+
+            sfe::log("Starting replay programmatically: %s", s_replay_path);
+            InterlockedExchange(&s_start_request, 1);
+            m_start_armed = true;
+            m_state_tick  = GetTickCount();
             break;
         }
 
-        const NavStep& step = k_nav[m_nav_step];
-        const uint32_t waited = GetTickCount() - m_state_tick;
-
-        if (!m_nav_armed) {
-            // Arm this step's injection. Do NOT advance here -- the step is
-            // only finished once the game has actually consumed it. Advancing
-            // on arm (the original bug) made every second step be skipped
-            // without ever being offered to the game.
-            if (waited >= step.delay_ms) {
-                s_inject_dik = step.dik;
-                m_nav_armed  = true;
-                sfe::log("Nav %d/%d: armed DIK 0x%02X (scene=%d)",
-                         m_nav_step + 1, countof(k_nav), step.dik, currentScene());
-                m_state_tick = GetTickCount();
-            }
-        } else if (s_inject_dik == 0) {
-            // Consumed by the game: this step really happened.
-            sfe::log("Nav %d/%d: CONSUMED (scene=%d)",
-                     m_nav_step + 1, countof(k_nav), currentScene());
-            m_nav_armed = false;
-            ++m_nav_step;
-            m_state_tick = GetTickCount();
-        } else if (waited > 3000) {
-            // The game never asked about this key. Either the menu does not
-            // poll it here, or the hook is not on the path this screen uses.
-            sfe::log("Nav %d/%d: DIK 0x%02X never consumed after 3s (scene=%d)",
-                     m_nav_step + 1, countof(k_nav), step.dik, currentScene());
-            s_inject_dik = 0;
-            m_nav_armed  = false;
-            ++m_nav_step;
-            m_state_tick = GetTickCount();
+        const LONG done = InterlockedCompareExchange(&s_start_done, 0, 0);
+        if (done == 1) {
+            sfe::log("readReplay accepted the file; setBattleMode(%ld, %d) done "
+                     "— scene requested", InterlockedCompareExchange(&s_start_mode, 0, 0),
+                     BATTLE_SUBMODE_REPLAY);
+            transitionTo(AutoState::START_REPLAY);
+        } else if (done == -1) {
+            // The game read the header and refused it.  This is a property of
+            // the .rep, not of our timing, so retrying cannot help.
+            finish(AutoState::FAILED, "the game rejected the .rep file");
+        } else if (GetTickCount() - m_state_tick > 10000) {
+            // onProcess never ran, which means the hook is not on the path the
+            // engine actually calls -- report that rather than timing out
+            // later against the battle deadline with no explanation.
+            finish(AutoState::FAILED,
+                   "scene onProcess was never called after arming the start");
         }
         break;
     }
@@ -731,14 +707,20 @@ FrameTag Session::onFrame() {
             m_capturing = true;
             transitionTo(AutoState::EXTRACTING);
             sfe::log("Battle reached after %u ms — capturing", elapsedMs());
-        } else if ((elapsedMs() - m_state_tick_logged) >= 5000) {
+        } else {
             // Log where the game actually is while we wait. Without this the
-            // only evidence of a failed navigation is "never reached battle",
-            // which cannot distinguish "still at the title" from "sitting in
-            // the wrong menu" from "playing but the scene id is unexpected".
-            m_state_tick_logged = elapsedMs();
-            sfe::log("START_REPLAY: waiting for battle (scene=%d, t=%u ms)",
-                     currentScene(), elapsedMs());
+            // only evidence of a failed start is "never reached battle", which
+            // cannot distinguish "still at the title" from "stuck in the
+            // loading scene" from "playing but the scene id is unexpected".
+            const int scene = currentScene();
+            if (scene != m_last_scene_logged) {
+                m_last_scene_logged = scene;
+                sfe::log("START_REPLAY: scene -> %d (t=%u ms)", scene, elapsedMs());
+            } else if ((elapsedMs() - m_state_tick_logged) >= 5000) {
+                m_state_tick_logged = elapsedMs();
+                sfe::log("START_REPLAY: waiting for battle (scene=%d, t=%u ms)",
+                         scene, elapsedMs());
+            }
         }
         if (m_state == AutoState::START_REPLAY && elapsedMs() > MS_BATTLE_DEADLINE) {
             // No retry. The old code re-ran the entire key script from a game
