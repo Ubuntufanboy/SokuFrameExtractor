@@ -108,6 +108,37 @@ _TICK_COLS = ("game_frame", "local_frame", "frame_index")
 # separately -- a gap in it means rows were lost between the ring and the file.
 _ROW_COL = "frame"
 
+# -------------------------------------------------------------------------
+# The CSV carries a free error-detecting code, and nothing was checking it
+# -------------------------------------------------------------------------
+# Every row stores each player's inputs twice: once as a 10-bit mask
+# (`p1_input`) and once expanded into ten boolean columns. Both are written
+# from the same uint16 in the same encoder-thread statement, so on honest
+# hardware they cannot disagree.
+#
+# That redundancy is a parity check over exactly the field that matters most.
+# A flipped bit in the labels is the worst corruption this project can ship:
+# it is invisible to a human, survives every structural check, and teaches a
+# world model that an action it never saw produced an outcome it never caused.
+# Video corruption is comparatively benign -- a few wrong pixels in one frame
+# of a 10,000-frame episode.
+#
+# So on hardware with known bit flips, this is the check that earns its keep.
+# It catches any single-bit error in either representation, plus any multi-bit
+# error that does not happen to corrupt both copies identically.
+_BUTTON_ORDER = ("up", "down", "left", "right",
+                 "a", "b", "c", "d", "change", "spell")
+_INPUT_ALL_MASK = 0x3FF
+
+
+def _mask_from_bools(row: dict, who: str) -> int:
+    """Rebuild the input mask from the expanded boolean columns."""
+    m = 0
+    for i, name in enumerate(_BUTTON_ORDER):
+        if int(row.get(f"{who}_{name}", 0) or 0):
+            m |= 1 << i
+    return m
+
 
 def _tick_column(fieldnames: list[str]) -> str | None:
     for c in _TICK_COLS:
@@ -143,13 +174,30 @@ def check_csv(csv_path: Path, report: Report) -> list[int] | None:
         rows: list[int] = []
         p1_any = p2_any = False
         bad_rows = 0
+        mask_mismatch = 0
+        mask_range = 0
+        first_bad: str | None = None
+        have_bools = all(f"p1_{b}" in reader.fieldnames for b in _BUTTON_ORDER)
         for row in reader:
             try:
                 frames.append(int(row[col]))
                 if has_row_col:
                     rows.append(int(row[_ROW_COL]))
-                p1_any |= int(row.get("p1_input", 0) or 0) != 0
-                p2_any |= int(row.get("p2_input", 0) or 0) != 0
+                for who in ("p1", "p2"):
+                    m = int(row.get(f"{who}_input", 0) or 0)
+                    if who == "p1":
+                        p1_any |= m != 0
+                    else:
+                        p2_any |= m != 0
+                    if m & ~_INPUT_ALL_MASK:
+                        mask_range += 1
+                        if first_bad is None:
+                            first_bad = f"row {len(frames)}: {who}_input={m}"
+                    if have_bools and _mask_from_bools(row, who) != m:
+                        mask_mismatch += 1
+                        if first_bad is None:
+                            first_bad = (f"row {len(frames)}: {who}_input={m} but "
+                                         f"columns say {_mask_from_bools(row, who)}")
             except (ValueError, TypeError):
                 bad_rows += 1
 
@@ -159,6 +207,21 @@ def check_csv(csv_path: Path, report: Report) -> list[int] | None:
 
     if bad_rows:
         report.add("csv.parse", Severity.ERROR, f"{bad_rows} unparseable row(s)")
+    if mask_range:
+        report.add(
+            "csv.mask_range", Severity.ERROR,
+            f"{mask_range} input value(s) with bits outside 0x{_INPUT_ALL_MASK:03X} "
+            f"({first_bad}). The game cannot produce these, so the value was "
+            f"corrupted after it was read.",
+        )
+    if mask_mismatch:
+        report.add(
+            "csv.mask_bits", Severity.ERROR,
+            f"{mask_mismatch} row(s) where the input bitmask disagrees with its "
+            f"own boolean columns ({first_bad}). Both are written from the same "
+            f"value, so any disagreement is corruption.",
+        )
+    report.stats["mask_mismatches"] = mask_mismatch
     if n == 0:
         report.add("csv.rows", Severity.ERROR, "no data rows")
         return None

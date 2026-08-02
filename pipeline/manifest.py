@@ -51,6 +51,17 @@ class Entry:
     reason: str | None = None
     video: str | None = None
     csv: str | None = None
+    # Digests of what was written, taken once at capture time.
+    #
+    # validate.py answers "was this capture correct when it was made?".
+    # These answer the different question "is it still what was made?" --
+    # which is the one that matters on a machine with non-ECC memory, a
+    # consumer HDD, and a training run that will read the corpus weeks later.
+    # Silent bit rot between capture and training is otherwise undetectable:
+    # an mp4 with a flipped bit still decodes, and a CSV with a flipped digit
+    # still parses.
+    video_sha256: str | None = None
+    csv_sha256: str | None = None
     validation: dict = field(default_factory=dict)
     meta: dict = field(default_factory=dict)
 

@@ -15,6 +15,7 @@ Everything is stdlib-only so this runs inside a slim container unchanged.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -77,6 +78,18 @@ class PrefixLock:
         if self._fh:
             self._fh.close()
         self.path.unlink(missing_ok=True)
+
+
+def _sha256(path: Path) -> str | None:
+    """Digest a capture artefact, streaming so a 100 MB video costs no RAM."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def used_gb(path: Path) -> float:
@@ -261,6 +274,10 @@ def capture_one(
                 if reason == "timeout"
                 else f"no status.json (game exited rc={rc})"
             )
+        if entry.status == "ok":
+            entry.video_sha256 = _sha256(out_dir / "video.mp4")
+            entry.csv_sha256 = _sha256(out_dir / "inputs.csv")
+
     finally:
         # Always tear the prefix down, even on an exception: a surviving game
         # process holds the FIFO open and wedges the *next* replay.
