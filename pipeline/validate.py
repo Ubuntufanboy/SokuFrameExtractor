@@ -257,20 +257,37 @@ def _most_common(values: list[int]) -> tuple[int, int]:
 
 
 def ffprobe_frame_count(video: Path) -> int | None:
-    """Count decoded frames. Returns None if ffprobe is unavailable or fails.
+    """Count coded frames. Returns None if ffprobe is unavailable or fails.
 
-    Uses -count_frames rather than the container's nominal frame count: a
-    truncated mp4 (FFmpeg killed mid-write) reports a plausible header value
-    while actually holding fewer frames, which is exactly the failure we want
-    to catch.
+    Counts *packets*, not decoded frames, and deliberately does not trust the
+    container header. Measured on a real 18 MB / 6055-frame capture, with the
+    file truncated to a fraction of its bytes:
+
+        bytes kept   count_frames   count_packets   header nb_frames
+           100%          6055           6055             6055
+            90%          5302           5303             6055
+            60%          3523           3524             6055
+            30%          1738           1739             6055
+
+    So the header is useless -- it reports the full count for a file that is
+    70% missing, which is exactly the failure this check exists to catch.
+
+    Packets track truncation as faithfully as full decoding does, differing by
+    one only on a damaged file (a trailing partial packet that will not
+    decode), where we are going to fail anyway. On an intact file the two agree
+    exactly, which is the case the 1:1 invariant is asserted against.
+
+    Decoding cost 14.30 s for that file; counting packets cost 0.21 s. That
+    ran after every capture on every worker, so it was ~14 s of dead time per
+    replay during which the worker captured nothing.
     """
     try:
         res = subprocess.run(
             [
                 "ffprobe", "-v", "error",
                 "-select_streams", "v:0",
-                "-count_frames",
-                "-show_entries", "stream=nb_read_frames",
+                "-count_packets",
+                "-show_entries", "stream=nb_read_packets",
                 "-of", "default=nokey=1:noprint_wrappers=1",
                 str(video),
             ],
