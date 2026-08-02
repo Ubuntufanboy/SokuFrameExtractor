@@ -284,24 +284,60 @@ def run_game(
 
 
 def _await_prefix_idle(env: dict[str, str], deadline: float) -> bool:
-    """Poll until no game process remains in the prefix, or `deadline` passes."""
+    """Poll until no game process remains in *this* prefix, or `deadline` passes."""
+    prefix = env["WINEPREFIX"]
     while time.monotonic() < deadline:
-        if not _game_running():
+        if not _game_running(prefix):
             return True
         time.sleep(1.0)
     return False
 
 
-def _game_running() -> bool:
-    """True if any Soku process is alive.
+def _game_running(prefix: str) -> bool:
+    """True if a Soku process belonging to `prefix` is alive.
 
-    Matches the ``th123`` stem so it catches both the ``th123e.exe`` launcher
-    and the ``th123.exe`` it spawns.
+    Two things here are deliberate, and the previous version got both wrong by
+    shelling out to ``pgrep -f th123``:
+
+    * **Match the executable, not the command line.** ``pgrep -f`` matches any
+      process whose *full command line* contains the pattern, which includes
+      the monitoring shell that happens to be running ``pgrep -x th123.exe``.
+      One stray shell made this return true forever, so every worker waited out
+      its entire timeout after a capture that had already succeeded. ``comm``
+      is the executable's own name and cannot be spoofed by an argument.
+
+    * **Scope to the prefix.** The check was machine-wide, so with four workers
+      each one waited for *every* other worker's game to exit too. Since the
+      others immediately start their next replay, that is never. It serialised
+      the swarm into something slower than a single job, silently.
+
+    The prefix is read from the process's own environment, which is where wine
+    put it, so this cannot drift from what the game was actually launched with.
     """
-    res = subprocess.run(
-        ["pgrep", "-f", r"th123"], capture_output=True, text=True
-    )
-    return res.returncode == 0 and bool(res.stdout.strip())
+    return bool(_game_pids(prefix))
+
+
+def _game_pids(prefix: str) -> list[int]:
+    """Pids of Soku processes launched into `prefix`."""
+    wanted = {prefix, os.path.realpath(prefix)}
+    found: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", "rb") as fh:
+                if not fh.read().strip().startswith(b"th123"):
+                    continue
+            with open(f"/proc/{entry}/environ", "rb") as fh:
+                environ = fh.read()
+        except OSError:
+            continue          # exited, or not ours to read
+        for var in environ.split(b"\0"):
+            if var.startswith(b"WINEPREFIX="):
+                if var[len(b"WINEPREFIX="):].decode(errors="replace") in wanted:
+                    found.append(int(entry))
+                break
+    return found
 
 
 def kill_prefix(prefix: Path) -> None:
@@ -319,10 +355,20 @@ def kill_prefix(prefix: Path) -> None:
         pass
     # Belt and braces: wineserver -k occasionally leaves the game behind if it
     # is wedged in a driver call.
+    #
+    # Both the check and the kill are scoped to this prefix. A bare
+    # `pkill -9 -f th123` would take down every *other* worker's game too --
+    # and, because -f matches command lines, any shell that merely mentions
+    # the name.
     for _ in range(3):
-        if not _game_running():
+        stuck = _game_pids(str(prefix))
+        if not stuck:
             return
-        subprocess.run(["pkill", "-9", "-f", r"th123"], capture_output=True)
+        for pid in stuck:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
         time.sleep(1.0)
 
 
