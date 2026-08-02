@@ -25,10 +25,8 @@
 //   acquireReadSlot()  blocks when the buffer is empty (no ready slots).
 // =========================================================================
 
-#include "config.hpp"
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include "sfe/config.hpp"
+#include <atomic>          // header-only, emits no msvcp140 imports
 #include <windows.h>
 
 namespace sfe {
@@ -145,11 +143,16 @@ private:
     alignas(64) std::atomic<uint64_t> m_write_pos{0};
     alignas(64) std::atomic<uint64_t> m_read_pos{0};
 
-    // Condition variables for blocking without busy-waiting.
-    std::mutex              m_mutex;
-    std::condition_variable m_cv_space;  // producer waits: buffer full
-    std::condition_variable m_cv_data;   // consumer waits: buffer empty
-    std::atomic<bool>       m_stop{false};
+    // Win32 rather than <mutex>/<condition_variable>: those live in msvcp140,
+    // whose Wine builtin aborts the process (see config.hpp). CRITICAL_SECTION
+    // and CONDITION_VARIABLE are kernel32 and fully implemented by Wine, and
+    // they are a closer match to what this needs anyway -- no exceptions, no
+    // allocation, no locale machinery dragged in behind them.
+    CRITICAL_SECTION   m_lock{};
+    CONDITION_VARIABLE m_cv_space{};   // producer waits: buffer full
+    CONDITION_VARIABLE m_cv_data{};    // consumer waits: buffer empty
+    bool               m_lock_ready = false;
+    std::atomic<bool>  m_stop{false};
 };
 
 } // namespace sfe

@@ -2,24 +2,41 @@
 // SokuFrameExtractor — logger.cpp
 // =========================================================================
 
-#include "logger.hpp"
+#include "sfe/logger.hpp"
 
 #include <windows.h>
 
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
-#include <mutex>
 
 namespace sfe {
 
 namespace {
-    FILE*      s_file = nullptr;
-    std::mutex s_mutex;
+    FILE* s_file = nullptr;
+
+    // CRITICAL_SECTION rather than std::mutex: <mutex> pulls in msvcp140,
+    // whose Wine builtin aborts the process (see config.hpp). Initialised
+    // lazily on first use -- the logger is the very first thing Initialize()
+    // touches, so it cannot depend on anything else having run.
+    CRITICAL_SECTION s_lock;
+    bool             s_lock_ready = false;
+
+    void ensureLock() {
+        if (!s_lock_ready) {
+            InitializeCriticalSection(&s_lock);
+            s_lock_ready = true;
+        }
+    }
+
+    struct Guard {
+        Guard()  { ensureLock(); EnterCriticalSection(&s_lock); }
+        ~Guard() { LeaveCriticalSection(&s_lock); }
+    };
 }
 
 bool initLog(const char* path) {
-    std::lock_guard<std::mutex> lk(s_mutex);
+    Guard lk;
     if (s_file) {
         fclose(s_file);
         s_file = nullptr;
@@ -31,7 +48,7 @@ bool initLog(const char* path) {
 }
 
 void closeLog() {
-    std::lock_guard<std::mutex> lk(s_mutex);
+    Guard lk;
     if (s_file) {
         fflush(s_file);
         fclose(s_file);
@@ -40,7 +57,7 @@ void closeLog() {
 }
 
 void log(const char* fmt, ...) {
-    std::lock_guard<std::mutex> lk(s_mutex);
+    Guard lk;
     if (!s_file) return;
 
     time_t now = time(nullptr);
@@ -59,7 +76,7 @@ void log(const char* fmt, ...) {
 }
 
 void logDwords(const char* prefix, const void* addr, int n) {
-    std::lock_guard<std::mutex> lk(s_mutex);
+    Guard lk;
     if (!s_file) return;
 
     time_t now = time(nullptr);

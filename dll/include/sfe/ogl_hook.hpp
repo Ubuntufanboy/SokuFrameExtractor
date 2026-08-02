@@ -38,10 +38,33 @@
 // No GL calls are made from the encoder thread.
 // =========================================================================
 
-#include "config.hpp"
-#include "video_encoder.hpp"
+#include "sfe/config.hpp"
+#include "sfe/video_encoder.hpp"
 
 namespace sfe {
+
+// -------------------------------------------------------------------------
+// What the owner tells us about the frame that is about to be presented.
+// -------------------------------------------------------------------------
+struct FrameTag {
+    bool     capture;      // false -> skip this frame entirely
+    int      frame_index;  // game tick this frame belongs to
+    uint16_t p1_input;
+    uint16_t p2_input;
+};
+
+// Called once per presented frame, on the game thread, BEFORE the pixels are
+// read.  The callee is expected to advance its own state machine and return
+// the tag describing the frame being presented right now.
+//
+// The ordering matters and is the whole reason this is a single call rather
+// than the previous arrangement of a heartbeat plus three separately-written
+// `staged_*` fields: pixels rendered for tick N must carry tick N's inputs.
+// Previously that held only because OGLHook happened to call the FSM first and
+// the FSM happened to write the staging fields before returning -- an
+// invariant spread across two files with nothing naming it.  Now the tag is
+// produced and consumed at one point, so it cannot drift.
+using FrameTagFn = FrameTag (*)(void* user);
 
 class OGLHook {
 public:
@@ -56,23 +79,17 @@ public:
     // ------------------------------------------------------------------
 
     // Patch wglSwapBuffers in opengl32.dll with a 5-byte JMP trampoline.
-    // encoder must outlive this OGLHook object.
-    // capturing: pointer to a bool controlled by FrameExtractor that
-    //            indicates whether we are currently in EXTRACTING state.
-    bool install(VideoEncoder* encoder, const bool* capturing);
+    // `encoder` must outlive this OGLHook.  `tag_fn` is invoked once per
+    // presented frame with `user`; see FrameTagFn above.
+    //
+    // Taking a callback here is what breaks the old cycle: ogl_hook.cpp used
+    // to #include frame_extractor.hpp to call getExtractor(), while
+    // frame_extractor.cpp #included ogl_hook.hpp to write the staging fields.
+    // Neither could be reasoned about, tested, or reused without the other.
+    bool install(VideoEncoder* encoder, FrameTagFn tag_fn, void* user);
 
     // Restore the original 5 bytes and release PBOs.
     void uninstall();
-
-    // ------------------------------------------------------------------
-    // Input staging (written by BattleManager::Process hook)
-    // ------------------------------------------------------------------
-
-    // The game thread writes current inputs here every Process tick so
-    // the SwapBuffers hook can bundle them with the pixel data.
-    volatile uint16_t staged_p1 = 0;
-    volatile uint16_t staged_p2 = 0;
-    volatile int      staged_frame_index = 0;
 
 private:
     // Called from the hooked wglSwapBuffers before the real swap.
@@ -89,7 +106,8 @@ private:
     bool createPBOs();
 
     VideoEncoder*  m_encoder   = nullptr;
-    const bool*    m_capturing = nullptr;
+    FrameTagFn     m_tag_fn    = nullptr;
+    void*          m_tag_user  = nullptr;
     bool           m_installed = false;
 
     // Saved original bytes at wglSwapBuffers entry point (for restore).

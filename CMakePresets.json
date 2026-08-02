@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "msvc-wine",
+      "displayName": "32-bit Windows DLL via msvc-wine",
+      "description": "The only supported configuration. Requires msvc-wine's cl/link/rc on PATH.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/msvc-wine",
+      "toolchainFile": "${sourceDir}/toolchains/msvc-wine.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "msvc-wine",
+      "configurePreset": "msvc-wine",
+      "targets": ["SokuFrameExtractor"]
+    }
+  ]
+}

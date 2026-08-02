@@ -1,0 +1,36 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0083a37..42dd82c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -139,16 +139,18 @@ endif()
+ 
+ target_include_directories(SokuLib INTERFACE src/ PUBLIC directx)
+ 
+-add_executable(
+-	SokuLibTests
+-	test/main.cpp
+-)
+-target_include_directories(SokuLibTests PRIVATE directx)
+-target_link_libraries(SokuLibTests SokuLib)
++if(SOKULIB_BUILD_TESTS)
++	add_executable(
++		SokuLibTests
++		test/main.cpp
++	)
++	target_include_directories(SokuLibTests PRIVATE directx)
++	target_link_libraries(SokuLibTests SokuLib)
+ 
+-add_library(
+-	SokuLibDllTests SHARED
+-	test/main.dll.cpp
+-)
+-target_include_directories(SokuLibDllTests PRIVATE directx)
+-target_link_libraries(SokuLibDllTests SokuLib)
++	add_library(
++		SokuLibDllTests SHARED
++		test/main.dll.cpp
++	)
++	target_include_directories(SokuLibDllTests PRIVATE directx)
++	target_link_libraries(SokuLibDllTests SokuLib)
++endif()
+\ No newline at end of file

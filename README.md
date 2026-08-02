@@ -5,859 +5,382 @@
 </p>
 
 <p align="center">
-  <b>Visual game-state extraction for training game-playing AI.</b>
+  <b>Frame-accurate gameplay capture for Touhou 12.3 (Hisoutensoku).</b>
   <br>
-  Capture what the game looks like, what the players did, and turn it into a dataset an AI can learn from.
+  Records what the game rendered and what both players pressed, one row per frame.
 </p>
-
----
-
-## Overview
-
-**SokuFrameExtractor** is a data collection pipeline for
-[Touhou 12.3: Hisoutensoku](https://hisouten.koumakan.jp/wiki/Introduction),
-designed specifically as infrastructure for training game-playing AI.
-
-The core idea is simple:
-
-> **Let the model learn the game from its pixels instead of handing it the game's internal state.**
-
-The extractor runs inside the game and records gameplay frames alongside the actions taken by each player. Replay files can also be parsed to recover historical input sequences.
-
-The resulting data can be assembled into large visual trajectories suitable for training models such as **AdaJEPA + LeWorld**, with the long-term goal of creating agents that can understand and act within the game based primarily on visual observations.
 
 <p align="center">
-  <img src="img/menu-movement.png" alt="Hisoutensoku game scene" width="640">
+  <video src="docs/assets/showcase.mp4" width="640" controls></video>
+  <br>
+  <a href="docs/assets/showcase.mp4"><b>▶ showcase.mp4</b></a> — captured frames with the
+  recorded inputs drawn back over them.
+  <br>
+  <sub>Each lit key is read from that frame's row in <code>inputs.csv</code>. If the
+  overlay and the action ever drifted apart, it would be visible here — which is
+  exactly why the overlay exists.</sub>
 </p>
 
 ---
 
-## Why?
+## What this is
 
-Most game-playing agents are given privileged information:
+A SWRSToys module that hooks the game's OpenGL present path, reads back each
+frame via asynchronous PBO transfers, and streams raw BGRA into FFmpeg through
+a FIFO — while recording both players' inputs for the same frame. The result is
+a video plus a CSV where **row *i* describes video frame *i***.
 
-- exact player coordinates
-- health values
-- hitboxes
-- velocities
-- enemy positions
-- game state variables
-- deterministic simulator state
+It is data-collection infrastructure for a world model that plays Soku from
+natural-language instructions. The model itself lives in a separate repo; this
+one produces its training data.
 
-That makes learning substantially easier, but it also sidesteps an important problem:
-
-**Can an AI actually learn how a game works from what it sees?**
-
-SokuFrameExtractor is designed around that question.
-
-Instead of exposing a structured game state, the dataset can contain observations like:
-
-```text
-visual observation
-       │
-       ▼
-┌─────────────────┐
-│   Game Frame    │
-│   640 × 480     │
-└────────┬────────┘
-         │
-         │ paired with
-         ▼
-┌─────────────────┐
-│ Player Actions  │
-│ movement/buttons │
-└────────┬────────┘
-         │
-         ▼
-    training data
+### Output
 
 ```
-
-Over many frames and many matches, this becomes a collection of visual trajectories:
-
-```text
-Frame t ──────► Action t ──────► Frame t+1
-   │                                │
-   └──────────── trajectory ────────┘
-
+out/<replay-stem>-<sha8>/
+  video.mp4     # 640x480 H.264, 60 fps
+  inputs.csv    # one row per video frame
+  ffmpeg.log
+  wine.log
+out/manifest.jsonl
 ```
 
-The objective is to provide enough data for a model to learn representations of the game world, its dynamics, and eventually useful policies.
-
-Furthermore, this same technology could be applied to games with anti-cheats and/or games too complex to easily extract meaningful data in memory. Soku is just a test for more complex games.
-
-
-----------
-
-# Architecture
-
-The project is split into several stages.
-
-```text
-                 Touhou Hisoutensoku
-                         │
-                         ▼
-              ┌─────────────────────┐
-              │ SokuFrameExtractor   │
-              │       DLL            │
-              └──────────┬──────────┘
-                         │
-              ┌──────────┴──────────┐
-              │                     │
-              ▼                     ▼
-        Visual Frames          Player Inputs
-          (BMP/BGRA)            (bitmasks)
-              │                     │
-              └──────────┬──────────┘
-                         ▼
-                 Per-Replay Dataset
-                         │
-                         ▼
-                 SQLite / Data Lake
-                         │
-                         ▼
-              Visual Learning Pipeline
-                         │
-                         ▼
-                  AdaJEPA + LeWorld
-                         │
-                         ▼
-                    AI Agent
-
-```
-
-### 1. Game instrumentation
-
-`SokuFrameExtractor.dll` is loaded as an SWRSToys module.
-
-It hooks into the running game and captures rendered frames while simultaneously recording the players' inputs.
-
-### 2. Frame extraction
-
-Frames are saved at gameplay time and associated with their corresponding frame index.
-
-By default, frames are written as BMP images:
-
-```text
-soku_extract/
-└── <replay>/
-    ├── frames/
-    │   ├── 000000.bmp
-    │   ├── 000001.bmp
-    │   ├── 000002.bmp
-    │   └── ...
-    └── inputs.csv
-
-```
-
-### 3. Action recording
-
-Each frame records both players' controller states.
-
-Inputs are represented as bitmasks, making the representation compact and easy to process.
-
-### 4. Replay parsing
-
-Existing `.rep` files can be parsed independently of live extraction.
-
-The replay parser recovers metadata and frame-by-frame player input sequences from Hisoutensoku replay files.
-
-### 5. Dataset construction
-
-`build_database.py` combines extracted frames and input data into an SQLite database.
-
-This gives downstream training code a straightforward way to query:
-
-```sql
-SELECT frame_file, p1_input
-FROM frames
-WHERE replay_id = 1
-ORDER BY frame_index;
-
-```
-
-----------
-
-# Input Representation
-
-Each player's input state is stored as a 16-bit bitmask. 
-
-0. `0x001` Up
-
-1. `0x002` Down
-
-2. `0x004` Left
-
-3. `0x008` Right
-
-4. `0x010` A — Melee
-
-5. `0x020` B — Weak Bullet
-
-6. `0x040` C — Strong Bullet
-
-7. `0x080`D — Dash
-
-8. `0x100`Change Card
-
-9. `0x200` (Spell / Use Card)
-
-Directional combinations naturally represent numpad notation:
-
-```text
-7 8 9
-4 5 6
-1 2 3
-
-```
-
-For example:
-
-```text
-8       Up
-6       Right
-2       Down
-4       Left
-9       Up + Right
-1       Down + Left
-5       Neutral
-
-```
-
-This means a single frame can be represented by a compact action vector while the model still receives the full rendered observation.
-
-----------
-
-# Dataset Format
-
-A single extracted replay looks approximately like:
-
-```text
-soku_extract/
-└── match_001/
-    ├── frames/
-    │   ├── 000000.bmp
-    │   ├── 000001.bmp
-    │   ├── 000002.bmp
-    │   └── ...
-    └── inputs.csv
-
-```
-
-The CSV associates each frame with the actions of both players.
-
-The database builder converts this into a queryable SQLite dataset containing:
-
--   replay metadata
-    
--   frame indices
-    
--   frame paths
-    
--   raw player input masks
-    
--   individual input components
-    
--   per-replay frame counts
-    
-
-This is intentionally simple: the extracted dataset should be easy to feed into whatever training pipeline comes next.
-
-----------
-
-# AI Training Direction
-
-The intended downstream model is based around **AdaJEPA + LeWorld**.
-
-Rather than training a policy directly from pixels → controller actions, the broader goal is to learn a useful representation of the game world.
-
-A simplified conceptual pipeline is:
-
-```text
-                 Current Frame
-                       │
-                       ▼
-                Visual Encoder
-                       │
-                       ▼
-                 World Model
-                       │
-              ┌────────┴────────┐
-              │                 │
-              ▼                 ▼
-       Representation      Predicted Future
-              │                 │
-              └────────┬────────┘
-                       ▼
-                  Action Model
-                       │
-                       ▼
-                 Game Controller
-
-```
-
-The dataset therefore needs more than isolated screenshots.
-
-**Temporal structure matters.**
-
-A useful training sample should look like:
-
-```text
-Iₜ
- │
- ├── actionₜ
- │
- ▼
-Iₜ₊₁
- │
- ├── actionₜ₊₁
- │
- ▼
-Iₜ₊₂
- │
- ├── ...
- ▼
-...
-
-```
-
-This allows the model to learn relationships such as:
-
--   movement
-    
--   attacks
-    
--   projectiles
-    
--   hit reactions
-    
--   animation states
-    
--   character positioning
-    
--   stage geometry
-    
--   opponent behavior
-    
--   temporal consequences of actions
-    
--   transitions between game states
-    
-
-The long-term goal is to move from **"predict the next frame"** toward **"understand enough of the visual game world to make useful decisions."**
-
-----------
-
-# Running at Scale
-
-One of the unusual requirements of this project is that the game is intended to run on **distributed headless Linux servers**.
-
-The target deployment therefore looks more like a dataset-generation cluster than a traditional game setup:
-
-```text
-                       Dataset Controller
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-              ▼               ▼               ▼
-          Linux Node 1    Linux Node 2    Linux Node 3
-              │               │               │
-             Wine            Wine            Wine
-              │               │               │
-              ▼               ▼               ▼
-           Soku #1          Soku #2          Soku #3
-              │               │               │
-              ▼               ▼               ▼
-           Frames           Frames           Frames
-              │               │               │
-              └───────────────┼───────────────┘
-                              ▼
-                       Dataset Storage
-
-```
-
-The important property is that the game does **not** need to be played interactively by a human.
-
-The environment can be launched under Wine on a headless Linux machine, accelerated as much as possible, and used as a data-generation worker.
-
-This makes it possible to scale collection horizontally:
-
-```text
-1 machine       → thousands of frames
-10 machines     → tens of thousands
-100 machines    → millions
-N machines      → potentially enormous trajectories
-
-```
-
-The exact bottleneck will depend on rendering, frame extraction, encoding, storage, and the rate at which useful gameplay can be generated.
-
-We find that the resources needed to run Soku are light enough to run on servers with as little as 1 cpu core and 2gb of ram. Just ensure you have ``multilib`` or whatever 32 bit package support your distro requires.
-
-----------
-
-# Fast-Forward Extraction
-
-When extracting replay data, the normal 60 FPS limiter can be disabled.
-
-```ini
-FastForward = 1
-
-```
-
-This allows extraction to run as quickly as the host machine can process it rather than waiting for real-time gameplay.
-
-That is particularly important for distributed dataset generation. Otherwise the collection time can be unreasonable.
-
-----------
-
-# Configuration
-
-The extractor is configured through `SokuFrameExtractor.ini`.
-
-Example:
-
-```ini
-[General]
-
-OutputDir = soku_extract
-ReplayDir = replay
-
-SaveAsBMP = 1
-FastForward = 1
-SkipFrames = 0
-Verbose = 0
-
-EncoderThreads=4
-UseRenderTarget=1
-
-```
-
-Important settings include:
-
-`OutputDir` (Where extracted replay data is stored)
-
-`ReplayDir` (Directory containing `.rep` files)
-
-`SaveAsBMP` (Save frames as BMP images)
-
-`FastForward` (Remove the normal frame limiter during extraction. Enable this!)
-
-`SkipFrames` (Ignore the first N frames of each replay. There is typically a delay of 2s every match)
-
-`Verbose` (Enable additional logging)
-
-`EncoderThreads` (Number of encoding worker threads)
-
-`UseRenderTarget` (Select the render-target capture path)
-
-----------
-
-# Building
-
-## Requirements
-
-The native extractor currently expects:
-
--   Windows-compatible C++17 toolchain
-    
--   CMake 3.15+
-    
--   [SokuLib](https://github.com/SokuDev/SokuLib)
-    
--   DirectX 9 development libraries
-    
--   SWRSToys module environment
-    
--   MinGW/MSVC-compatible build environment as appropriate
-    
-
-Set the SokuLib path when configuring:
+`inputs.csv` columns:
+
+| column | meaning |
+|---|---|
+| `frame` | dense row counter — this is what video frame *N* maps to |
+| `game_frame` | engine tick the frame came from (may repeat if the game presents twice per tick) |
+| `p1_input` / `p2_input` | raw 10-bit mask |
+| `p1_up` … `p2_spell` | the same mask expanded to 20 boolean columns |
+
+Input bits: `0x001` up, `0x002` down, `0x004` left, `0x008` right, `0x010` A
+(melee), `0x020` B (weak bullet), `0x040` C (strong bullet), `0x080` D (dash),
+`0x100` change card, `0x200` spell.
+
+Directory names are keyed on the source `.rep`'s content hash, so every capture
+is attributable to the exact file that produced it.
+
+---
+
+## Status
+
+**Working and verified**
+
+- Frame capture: `wglSwapBuffers` hook, 3-deep PBO ring, ~600 MB/s of BGRA into
+  a FIFO. Sustained 58–238 fps with the frame limiter removed.
+- Input capture frame-aligned with the video, 1:1 by construction (both are
+  written from the same ring slot, on the same thread).
+- Reproducible cross-build of the DLL from Linux (MSVC via msvc-wine).
+- `pipeline/validate.py` integrity gate, regression-tested against known-bad
+  captures.
+- One replay per game process, with machine-readable status and a real exit
+  code.
+- Headless rendering under Xvfb + Mesa llvmpipe (verified by screenshot).
+
+- Recovery of legacy BMP captures into the modern layout
+  (`pipeline/from_bmp.py`), and the showcase clip above, built from real
+  recorded gameplay.
+
+**Not working: automated menu navigation**
+
+Capture is proven; *starting* a replay without a human is not. The module
+cannot drive the game's menus, so every capture so far — including the
+showcase above — came from a person pressing the keys while the extractor
+recorded.
+
+Soku reads the keyboard through DirectInput, and under Wine nothing
+synthetic reaches it. Seven approaches were tried and all fail identically:
+the game renders normally and the scene id never moves.
+
+| approach | layer | result |
+|---|---|---|
+| `SendInput` | Win32 | swallowed |
+| `SendInput` + `SetForegroundWindow`/`SetFocus` | Win32 | swallowed |
+| `PostMessage(WM_KEYDOWN/WM_KEYUP)` | Win32 | swallowed |
+| `SendInput` + a window manager for focus | Win32 | swallowed |
+| `xdotool` / XTEST | X server | swallowed |
+| `/dev/uinput` virtual keyboard | kernel | device is global — types into the host's desktop; unavailable in an unprivileged container |
+| hooking `checkKeyOneshot` (`0x0043DE30`) | game code | hook installs, but the game never calls it — 0 invocations logged |
+
+Starting a replay *without* the menus gets further but also fails:
+`InputManager::readReplay` (`0x0042EAC0`) succeeds and
+`changeScene(SCENE_LOADING)` really does change the scene, but the game then
+faults at `0x4386a6` — `mov eax,[ecx]` where `ecx` is the still-null
+BattleManager at `0x008985E4`. It reproduces with this module's vtable hook
+disabled, so it is missing game setup rather than interference from us.
+
+Unblocking this needs either the rest of the replay-menu start sequence
+reverse-engineered, or a real Windows environment where DirectInput behaves
+normally.
+
+**Not built yet**
+
+- `.npz` shard export for the training repo.
+- Validated matchup metadata — see `pipeline/REPPARSE_STATUS.md`.
+- Unattended collection at corpus scale (blocked on the above).
+
+---
+
+## Quick start
+
+The game is **not** included and is never baked into an image; point the tools
+at your own installation.
 
 ```bash
-cmake -S . -B build \
-  -DSOKULIB_DIR=/path/to/SokuLib
+# 1. Build the module (needs msvc-wine; see Building)
+cmake --preset msvc-wine
+cmake --build --preset msvc-wine
+cp build/msvc-wine/dll/SokuFrameExtractor.dll \
+   "$WINEPREFIX/drive_c/Games/Soku/modules/SokuFrameExtractor/"
 
+# 2. Collect (in the container — see Known issues for why)
+docker build -f docker/collect.Dockerfile -t sfe-collect .
+docker run --rm --cpus 2 --memory 4g \
+  -v "$HOME/.wine-soku:/prefix" \
+  -v "$PWD/out:/out" \
+  sfe-collect --prefix /prefix --out /out --limit 3
+
+# 3. Check what you got
+python3 -m pipeline.validate out/
+
+# 4. Look at it — overlay the inputs onto the video
+python3 -m pipeline.overlay out/<capture>/
+
+# 5. Build the showcase reel
+python3 -m pipeline.trailer out/ -o docs/assets/showcase.mp4
 ```
 
-Then build:
+### Recovering older BMP-era captures
+
+Captures from before the video pipeline wrote one BMP per frame plus an
+`inputs.csv` with a `frame_file` column. Their `frame_index` is unreliable, but
+`frame_file` is not, so the row-to-frame pairing survives:
 
 ```bash
-cmake --build build --config Release
-
+python3 -m pipeline.from_bmp <old-capture>/ -o out/recovered
 ```
 
-The resulting module is:
+It sorts by `frame_file` to restore true order, selects the longest run of
+contiguous frames (older captures dropped many), and emits the modern
+`video.mp4` + `inputs.csv`. The showcase above was produced this way.
 
-```text
-SokuFrameExtractor.dll
+### Running on a machine you are using
 
-```
+Collection is CPU-hungry: llvmpipe rasterises in software and x264 encodes
+beside it. `--cpus` (default: half your cores, capped at 4) pins the run to the
+highest-numbered cores at `nice 19`, which keeps a desktop responsive. Scale out
+with more containers rather than more cores per job.
 
-Install/copy it into the appropriate SWRSToys modules directory alongside:
+`--out` must be on real storage. The runner refuses to write to `tmpfs`
+(`/tmp` on most distributions) — a full corpus is several GB and would be
+backed by RAM.
 
-```text
-SokuFrameExtractor.ini
+---
 
-```
+## Building
 
-----------
+**MSVC is required. MinGW is not a supported alternative.** SokuLib binds the
+game's C++ objects through hardcoded vtable indices and
+`__thiscall`/`__fastcall` member pointers, which are MSVC ABI details. A MinGW
+build links cleanly and then corrupts the game at runtime, so `CMakeLists.txt`
+refuses to configure with anything else.
 
-# Replay Parsing
-
-The replay parser can recover per-frame inputs from existing `.rep` files.
-
-Basic usage:
+The supported toolchain is [msvc-wine](https://github.com/mstorsjo/msvc-wine),
+which runs the real MSVC compiler under Wine. Note that its installer downloads
+the MSVC toolchain from Microsoft under the Visual Studio licence, so the build
+image is for local use and must not be pushed to a public registry.
 
 ```bash
-python scripts/soku_replay_parser.py <replay_directory>
-
+git submodule update --init --recursive     # pins SokuLib
+source scripts/msvc-env.sh                  # puts cl/link/rc on PATH
+cmake --preset msvc-wine
+cmake --build --preset msvc-wine
 ```
 
-Specify an output database:
+Verify the result exports what SWRSToys resolves by name:
 
 ```bash
-python scripts/soku_replay_parser.py \
-    replay/ \
-    --db soku_training.db
-
+i686-w64-mingw32-objdump -p build/msvc-wine/dll/SokuFrameExtractor.dll | grep -A4 'Ordinal/Name'
+# CheckVersion, Initialize   (pei-i386)
 ```
 
-Verbose logging:
+---
+
+## Configuration
+
+`config/sfe.ini` is the single source of truth, installed next to the DLL as
+`SokuFrameExtractor.ini`. The runner rewrites it per job.
+
+| key | meaning |
+|---|---|
+| `ReplayDir` | directory holding the **one** staged `.rep` |
+| `OutputDir` | where `inputs.csv` is written |
+| `FifoPath` | video sink; `Z:\` maps to the Linux filesystem root |
+| `StatusPath` | where the DLL writes its machine-readable result |
+| `FastForward` | remove the 60 fps limiter while capturing |
+| `Verbose` | per-frame FSM logging |
+
+`tests/test_config_parity.py` fails if this file, `loadConfig()`, and
+`struct Config` ever disagree. They had drifted badly before: the shipped
+`.ini` advertised three options no code read, while the loader read two that
+appeared in no `.ini`.
+
+---
+
+## Design notes
+
+**One replay per game process.** The runner stages exactly one `.rep`, launches
+the game, and waits for it to exit. This is what makes replay identity exact
+(the game can only see one file), isolates crashes to a single replay, and
+makes parallelism a matter of running more containers.
+
+The earlier design walked a 397-entry list inside one long-lived process and
+named output from a counter. Two defects followed from that shape, both
+recoverable from the shipped output:
+
+- Capture stayed armed between replays, so menus and result screens were
+  recorded under a frozen gameplay frame index. One file repeats frame 8622
+  **31,789 times** — 79% of its rows.
+- The per-replay CSV was swapped on the game thread while the encoder thread
+  was still draining the previous replay, so each file begins with its
+  predecessor's tail. Each CSV starts at exactly the frame its predecessor got
+  stuck on: 9718 → 8622 → 7696, three consecutive files.
+
+`pipeline/validate.py` exists so that class of corruption cannot pass silently
+again; it is regression-tested against those files.
+
+**The input overlay is a QA instrument.** Every automated check is structural —
+row counts match, indices increase, the video decodes. None can tell you
+whether the inputs on frame *N* produced the action visible on frame *N*.
+Watching a button light up as a character swings can, which is why
+`pipeline/overlay.py` is part of the pipeline rather than a presentation
+afterthought.
+
+---
+
+## Known issues
+
+### The module crashes at load under new-WoW64 Wine
+
+Wine builds without `/usr/lib/wine/i386-unix/` run 32-bit Windows code thunked
+through a 64-bit host process. The extractor patches 32-bit code inline — a
+5-byte JMP over `wglSwapBuffers` and a BattleManager vtable overwrite — which is
+exactly the surface that changes. The game dies with `C0000005` before the
+module logs anything.
+
+Check with:
 
 ```bash
-python scripts/soku_replay_parser.py \
-    replay/ \
-    --db soku_training.db \
-    --verbose
-
+ls -d /usr/lib/wine/i386-unix    # missing => new-WoW64 only
 ```
 
-The parser extracts information including:
+Use `docker/collect.Dockerfile`, which installs Debian bookworm's `wine32:i386`
+— a classic WoW64 build with real 32-bit libraries. The container is
+load-bearing for correctness here, not just reproducibility.
 
--   game version
-    
--   character IDs
-    
--   character names
-    
--   palettes
-    
--   decks
-    
--   stage
-    
--   music
-    
--   replay file hash
-    
--   frame count
-    
--   per-frame player input bitmasks
-    
+### Wine's builtin `msvcp140.dll` aborts the process
 
-----------
-
-# Building the Dataset Database
-
-Once frame extraction has produced replay directories, use:
-
-```bash
-python scripts/build_database.py soku_extract/
+A separate failure, and the one that bites in a *fresh* prefix. The module is
+built with MSVC and uses `std::thread`/`std::mutex`, whose failure paths call
+`?_Throw_Cpp_error@std@@YAXH@Z`. Wine's builtin `msvcp140.dll` does not
+implement it, and Wine aborts the moment it is called:
 
 ```
-
-Or specify the database path:
-
-```bash
-python scripts/build_database.py \
-    soku_extract/ \
-    --db soku_training.db
-
+wine: Call from ... to unimplemented function
+      msvcp140.dll.?_Throw_Cpp_error@std@@YAXH@Z, aborting
 ```
 
-Verbose output:
+The symptom is misleading: `SokuFrameExtractor.log` exists but is **0 bytes** —
+`initLog()`'s `fopen` succeeded and the abort landed before the first log line
+was written. That looks exactly like "the module never loaded", but it did.
+Check `wine.log` and `/proc/<pid>/maps` before concluding otherwise.
 
-```bash
-python scripts/build_database.py \
-    soku_extract/ \
-    --db soku_training.db \
-    --verbose
+`docker/entrypoint.sh` installs the real runtime (`winetricks -q vcrun2019`,
+network needed on first run only) and sets `msvcp140=n,b`. Set
+`SFE_SKIP_VCRUN=1` to skip it if you provide the DLLs yourself.
 
-```
+The durable fix is to drop the MSVC C++ STL from the module — Win32
+`CreateThread` / `CRITICAL_SECTION` / `CONDITION_VARIABLE` instead of
+`std::thread` / `std::mutex` — which removes the redistributable dependency
+entirely. Not done yet.
 
-The resulting SQLite database can be queried directly or used as the metadata layer for a larger training-data pipeline.
+### A crash during module load disables the module behind a modal dialog
 
-----------
+SWRSToys records the module it is loading in `currentModule.txt` and clears the
+file on success. If the game dies in between, the next launch disables that
+module and shows a dialog:
 
-# Example Queries
+> SokuFrameExtractor.dll has been disabled because the game crashed while
+> loading it last time.
 
-Get frames from a replay:
+Headless, nobody clicks OK, so the game waits at the dialog forever — one crash
+turns an unattended run into a series of identical timeouts, with empty logs
+because the module never ran. `runner.wine.clear_crash_sentinel()` clears this
+before every launch.
 
-```sql
-SELECT
-    frame_file,
-    frame_index,
-    p1_input,
-    p2_input
-FROM frames
-WHERE replay_id = 1
-ORDER BY frame_index;
+### `Initialize()` runs under the Windows loader lock
 
-```
+SWRSToys calls it from inside its own `DllMain`. Do not create threads there —
+the new thread's `DLL_THREAD_ATTACH` needs the lock you are holding, and the
+game crashes during module load. `VideoEncoder::start()` is deliberately
+deferred to the first `onFrame()`, on the game thread.
 
-Find frames where Player 1 used melee:
+### Synthetic keyboard input does not reach the game under Wine
 
-```sql
-SELECT
-    frame_file,
-    frame_index
-FROM frames
-WHERE p1_a = 1;
+Soku reads the keyboard through DirectInput, and Wine's dinput reads key state
+from the X server rather than from Wine's synthetic Win32 input queue. Every
+in-process injection mechanism is therefore swallowed: the game renders its
+title screen normally and the scene id never moves.
 
-```
+Confirmed not working, each tested in the container with the mod loader active:
 
-Count the total number of collected frames:
+| approach | result |
+|---|---|
+| `SendInput` | swallowed |
+| `SendInput` + `SetForegroundWindow`/`SetFocus` | swallowed |
+| `PostMessage(WM_KEYDOWN/WM_KEYUP)` | swallowed |
+| `SendInput` + a real window manager (openbox) for focus | swallowed |
+| writing `KeymapManager.inKeys` directly | crashed (offsets unverified) |
 
-```sql
-SELECT SUM(total_frames)
-FROM replays;
+Menu navigation therefore lives in `runner/menu.py`, outside the game, driving
+it through **XTEST** (`xdotool`) so the X server generates the key events by
+the same path a physical keyboard would.
 
-```
+### Starting a replay without the menus does not work either
 
-----------
+`InputManager::readReplay(path)` (`0x0042EAC0`) succeeds and
+`changeScene(SCENE_LOADING)` really does move the scene, but the game then
+faults at `0x4386a6` -- `mov eax,[ecx]` where `ecx` is the BattleManager global
+at `0x008985E4`, still null. Setting `mainMode`/`subMode` to
+`VSPLAYER`/`REPLAY` does not prevent it, and it reproduces with this module's
+vtable hook disabled, so it is missing game setup rather than interference from
+us. The replay menu evidently applies more state (characters/stage from the
+replay header) before switching scene. The code is kept in `session.cpp` for
+whoever picks this up.
 
-# Data Generation Strategy
+### Xvfb rejects depth 32
 
-The dataset is intended to grow from several complementary sources.
+`-screen 0 640x480x32` fails with "Couldn't add screen 0". Use depth 24; Mesa
+still provides llvmpipe GL 4.5, well beyond the GL 2.1-era PBOs this needs.
 
-### 1. Human gameplay
+---
 
-Human replays provide naturally occurring behavior and can expose the model to:
-
--   neutral game
-    
--   combos
-    
--   defensive play
-    
--   movement
-    
--   mistakes
-    
--   adaptation
-    
--   character-specific strategies
-    
-
-### 2. Self-play
-
-Once an initial agent exists, generated games can provide increasingly large amounts of on-policy data.
-
-```text
-Human Data
-    │
-    ▼
-Initial Model
-    │
-    ▼
-Self-Play
-    │
-    ▼
-More Data
-    │
-    ▼
-Better Model
-    │
-    └──────────────► Self-Play
+## Repository layout
 
 ```
-
-### 3. Distributed environment generation
-
-Multiple Wine instances can run simultaneously on independent Linux workers, allowing large-scale generation without requiring physical machines dedicated to playing the game.
-
-----------
-
-# Why Capture Pixels?
-
-A central design goal is to avoid building an AI that only works because we gave it access to the game's internal implementation.
-
-The desired interface is closer to:
-
-```text
-                 ┌───────────────┐
-                 │     Game      │
-                 └───────┬───────┘
-                         │
-                       pixels
-                         │
-                         ▼
-                 ┌───────────────┐
-                 │   AI Vision   │
-                 └───────┬───────┘
-                         │
-                   representation
-                         │
-                         ▼
-                 ┌───────────────┐
-                 │ World Model / │
-                 │    Policy     │
-                 └───────┬───────┘
-                         │
-                       action
-                         │
-                         ▼
-                 ┌───────────────┐
-                 │     Game      │
-                 └───────────────┘
-
+dll/          C++ SWRSToys module (hook, ring buffer, encoder, FSM)
+runner/       host orchestration: staging, FIFO/FFmpeg, Wine, CPU budget
+pipeline/     dataset tooling: validation, manifest, overlay, .rep parsing
+docker/       build and collection images
+toolchains/   msvc-wine CMake toolchain
+tests/        config parity and pipeline tests
+config/       sfe.ini — the single source of truth
 ```
 
-This makes the project useful as more than a fighting-game bot.
+---
 
-The same philosophy can eventually be applied to other games and environments:
+## Licence
 
-**observe → understand → predict → act.**
-
-----------
-
-# Project Structure
-
-```text
-SokuFrameExtractor/
-├── img/
-│   ├── gameplay.png
-│   └── menu-movement.png
-│
-├── src/
-│   ├── main.cpp
-│   ├── frame_extractor.cpp
-│   ├── frame_extractor.hpp
-│   ├── video_encoder.cpp
-│   ├── video_encoder.hpp
-│   ├── ring_buffer.cpp
-│   ├── ring_buffer.hpp
-│   ├── ogl_hook.cpp
-│   ├── ogl_hook.hpp
-│   ├── logger.cpp
-│   └── logger.hpp
-│
-├── scripts/
-│   ├── soku_replay_parser.py
-│   └── build_database.py
-│
-├── CMakeLists.txt
-├── SokuFrameExtractor.ini
-└── LICENSE
-
-```
-
-----------
-
-# Current Status
-
-The project is functional and is being developed primarily as **AI dataset infrastructure**.
-
-The important pieces are in place:
-
--   Game-side frame extraction
-    
--   Per-frame input capture
-    
--   Replay parsing
-    
--   Frame/input association
-    
--   SQLite dataset construction
-    
--   Fast-forward extraction
-    
--   Wine/headless-oriented deployment
-    
--   Large-scale distributed orchestration
-    
--   Standardized training dataset format
-    
--   Efficient dataset streaming
-    
--   AdaJEPA + LeWorld training pipeline
-    
--   Autonomous agent inference loop
-    
--   Large-scale self-play
-    
-
-Some parts of the project are still... rough and may require additional work as the data-generation and model-training pipeline evolves.
-
-----------
-
-# Roadmap
-
-### Dataset Infrastructure
-
--   Move from individual BMP files toward efficient sequence storage
-    
--   Add dataset sharding
-    
--   Add compression
-    
--   Add dataset integrity checks
-    
--   Add train/validation/test splits
-    
--   Add temporal-window sampling
-    
--   Add metadata indexing
-    
-
-### Environment
-
--   Fully automate Wine deployment
-    
--   Improve headless rendering
-    
--   Containerize workers
-    
--   Add distributed job scheduling
-    
--   Automatically collect worker statistics
-    
--   Improve failure recovery
-    
-
-### Learning
-
--   Build AdaJEPA + LeWorld training pipeline
-    
--   Learn visual representations from gameplay
-    
--   Train temporal prediction/world models
-    
--   Learn action-conditioned dynamics
-    
--   Train an initial controller
-    
--   Introduce self-play
-    
--   Iterate between model improvement and environment-generated data
-    
-
-### Research
-
-This project is largely a way for me to experiment with real-time agents for robotics. Soku just happens to be a good medium for testing at cheaper scale.
-
-----------
-
-# Contributing
-
-Contributions to the extraction, replay parsing, dataset tooling, environment orchestration, and learning pipeline are welcome.
-
-----------
-
-# License
-
-BSD 2-Clause License.
-
-See `LICENSE` for the full license text.
-
+See [LICENSE](LICENSE). The game itself is not distributed here and is not
+covered by it.

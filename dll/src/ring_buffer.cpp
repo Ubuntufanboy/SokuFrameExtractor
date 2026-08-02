@@ -2,8 +2,8 @@
 // SokuFrameExtractor — ring_buffer.cpp
 // =========================================================================
 
-#include "ring_buffer.hpp"
-#include "logger.hpp"
+#include "sfe/ring_buffer.hpp"
+#include "sfe/logger.hpp"
 
 #include <cassert>
 #include <cstring>
@@ -40,17 +40,15 @@ bool RingBuffer::init() {
         return false;
     }
 
-    // Attempt to pin all pages in physical RAM.
-    // This requires RLIMIT_MEMLOCK ≥ m_alloc_sz on the Linux side.
-    // The start_sfe.sh wrapper sets  ulimit -l unlimited  before
-    // launching Wine so this should succeed.  If it fails we log and
-    // continue — the buffer still works, just with potential page faults
-    // on first access (which happen at warmup anyway).
+    // Try to pin the pages in physical RAM.  Needs RLIMIT_MEMLOCK >=
+    // m_alloc_sz, which the default 8 MB limit does not grant; the runner
+    // raises it where it can (docker --ulimit memlock).  Failure is harmless:
+    // the ring still works, it just may take page faults on first touch, and
+    // the loop below pre-faults every page anyway.
     if (!VirtualLock(m_slots, m_alloc_sz)) {
-        sfe::log("RingBuffer: VirtualLock failed (GLE=%lu) — "
-                 "pages not pinned, continuing without lock",
+        sfe::log("RingBuffer: VirtualLock failed (GLE=%lu) — pages not pinned, "
+                 "continuing (harmless; raise RLIMIT_MEMLOCK to silence)",
                  GetLastError());
-        sfe::log("RingBuffer: ensure 'ulimit -l unlimited' is set in start_sfe.sh");
     } else {
         sfe::log("RingBuffer: %zu MB pinned in physical RAM", m_alloc_sz / (1024*1024));
     }
@@ -63,6 +61,13 @@ bool RingBuffer::init() {
         for (SIZE_T off = 0; off < m_alloc_sz; off += page) {
             p[off] = 0;
         }
+    }
+
+    if (!m_lock_ready) {
+        InitializeCriticalSection(&m_lock);
+        InitializeConditionVariable(&m_cv_space);
+        InitializeConditionVariable(&m_cv_data);
+        m_lock_ready = true;
     }
 
     m_write_pos.store(0, std::memory_order_relaxed);
@@ -82,6 +87,11 @@ void RingBuffer::shutdown() {
         m_slots = nullptr;
     }
     m_alloc_sz = 0;
+
+    if (m_lock_ready) {
+        DeleteCriticalSection(&m_lock);
+        m_lock_ready = false;
+    }
     sfe::log("RingBuffer: shut down");
 }
 
@@ -101,14 +111,13 @@ FrameSlot* RingBuffer::acquireWriteSlot() {
         }
 
         // Buffer full: back-pressure the game thread.
-        {
-            std::unique_lock<std::mutex> lk(m_mutex);
-            m_cv_space.wait(lk, [this, w]() {
-                return (w - m_read_pos.load(std::memory_order_acquire))
-                           < static_cast<uint64_t>(RING_CAPACITY)
-                       || m_stop.load(std::memory_order_relaxed);
-            });
+        EnterCriticalSection(&m_lock);
+        while ((w - m_read_pos.load(std::memory_order_acquire))
+                   >= static_cast<uint64_t>(RING_CAPACITY)
+               && !m_stop.load(std::memory_order_relaxed)) {
+            SleepConditionVariableCS(&m_cv_space, &m_lock, INFINITE);
         }
+        LeaveCriticalSection(&m_lock);
 
         if (m_stop.load(std::memory_order_relaxed)) {
             return nullptr;
@@ -117,10 +126,21 @@ FrameSlot* RingBuffer::acquireWriteSlot() {
 }
 
 void RingBuffer::commitWriteSlot() {
-    // Advance write head — this makes the slot visible to the consumer.
+    // The position update must happen under the same mutex the waiter's
+    // predicate is evaluated against, otherwise this interleaving loses the
+    // wakeup entirely:
+    //
+    //   consumer: evaluates predicate -> false (buffer empty)
+    //   producer: fetch_add(write_pos); notify_one()   <- no waiter yet
+    //   consumer: goes to sleep, having missed the notify
+    //
+    // The consumer then sleeps until the *next* commit. Under back-pressure
+    // that is a stall, not a deadlock, which is why it showed up as latency
+    // spikes rather than a hang -- and why it survived this long.
+    EnterCriticalSection(&m_lock);
     m_write_pos.fetch_add(1, std::memory_order_release);
-    // Wake the consumer if it is waiting.
-    m_cv_data.notify_one();
+    LeaveCriticalSection(&m_lock);
+    WakeConditionVariable(&m_cv_data);
 }
 
 // -------------------------------------------------------------------------
@@ -142,20 +162,23 @@ FrameSlot* RingBuffer::acquireReadSlot() {
         }
 
         // Buffer empty: wait for producer.
-        {
-            std::unique_lock<std::mutex> lk(m_mutex);
-            m_cv_data.wait(lk, [this, r]() {
-                return m_write_pos.load(std::memory_order_acquire) > r
-                       || m_stop.load(std::memory_order_relaxed);
-            });
+        EnterCriticalSection(&m_lock);
+        while (m_write_pos.load(std::memory_order_acquire) <= r
+               && !m_stop.load(std::memory_order_relaxed)) {
+            SleepConditionVariableCS(&m_cv_data, &m_lock, INFINITE);
         }
+        LeaveCriticalSection(&m_lock);
     }
 }
 
 void RingBuffer::releaseReadSlot() {
+    // Same lost-wakeup hazard as commitWriteSlot(), mirrored: without the
+    // lock, a producer blocked on a full ring can miss this notify and stall
+    // the game thread until the next frame is consumed.
+    EnterCriticalSection(&m_lock);
     m_read_pos.fetch_add(1, std::memory_order_release);
-    // Wake the producer if it is blocked on a full buffer.
-    m_cv_space.notify_one();
+    LeaveCriticalSection(&m_lock);
+    WakeConditionVariable(&m_cv_space);
 }
 
 // -------------------------------------------------------------------------
@@ -163,9 +186,20 @@ void RingBuffer::releaseReadSlot() {
 // -------------------------------------------------------------------------
 
 void RingBuffer::requestStop() {
+    // Same hazard as commit/release, but the consequence here is worse than a
+    // stall: if a waiter evaluates its predicate (not stopped, ring empty),
+    // and we then set the flag and notify before it sleeps, it sleeps forever
+    // and nothing will ever wake it again. That hangs VideoEncoder::stop() on
+    // thread.join(), i.e. the game never exits.
+    if (!m_lock_ready) {
+        m_stop.store(true, std::memory_order_relaxed);
+        return;
+    }
+    EnterCriticalSection(&m_lock);
     m_stop.store(true, std::memory_order_relaxed);
-    m_cv_space.notify_all();
-    m_cv_data.notify_all();
+    LeaveCriticalSection(&m_lock);
+    WakeAllConditionVariable(&m_cv_space);
+    WakeAllConditionVariable(&m_cv_data);
 }
 
 } // namespace sfe

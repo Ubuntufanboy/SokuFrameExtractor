@@ -32,9 +32,8 @@
 //             after writing the instruction bytes and flushing the icache.
 // =========================================================================
 
-#include "ogl_hook.hpp"
-#include "frame_extractor.hpp"
-#include "logger.hpp"
+#include "sfe/ogl_hook.hpp"
+#include "sfe/logger.hpp"
 
 #include <windows.h>
 #include <cstring>
@@ -77,12 +76,13 @@ OGLHook& getOGLHook() {
 // Install
 // -------------------------------------------------------------------------
 
-bool OGLHook::install(VideoEncoder* encoder, const bool* capturing) {
+bool OGLHook::install(VideoEncoder* encoder, FrameTagFn tag_fn, void* user) {
     if (m_installed) return true;
 
-    m_encoder   = encoder;
-    m_capturing = capturing;
-    s_instance  = this;
+    m_encoder  = encoder;
+    m_tag_fn   = tag_fn;
+    m_tag_user = user;
+    s_instance = this;
 
     // Locate wglSwapBuffers in opengl32.dll.
     HMODULE hGL = GetModuleHandleA("opengl32.dll");
@@ -327,10 +327,14 @@ bool OGLHook::releasePBOs() {
 // -------------------------------------------------------------------------
 
 void OGLHook::onBeforeSwap() {
-    // Heartbeat for the FSM — ensures it progresses even when not in battle.
-    getExtractor().onHeartbeat();
+    if (!m_tag_fn) return;
 
-    if (!m_capturing || !(*m_capturing)) return;
+    // Single call: advances the owner's state machine AND returns the tag for
+    // the frame about to be presented.  Must happen before the pixel read so
+    // frame N's pixels carry frame N's inputs.
+    const FrameTag tag = m_tag_fn(m_tag_user);
+
+    if (!tag.capture) return;
     if (!m_encoder) return;
 
     // ------------------------------------------------------------------
@@ -386,8 +390,11 @@ void OGLHook::onBeforeSwap() {
         m_pbo_ready[write_idx] = true;
 
         // Save metadata for this frame. It will be used when this PBO
-        // is mapped and consumed in (PBO_COUNT-1) frames.
-        m_pbo_metadata[write_idx] = { staged_frame_index, staged_p1, staged_p2 };
+        // is mapped and consumed in (PBO_COUNT-1) frames.  The tag travels
+        // with the PBO precisely because the pixels lag the tag by that many
+        // frames -- reading a "current" input at map time would mislabel every
+        // frame by the pipeline depth.
+        m_pbo_metadata[write_idx] = { tag.frame_index, tag.p1_input, tag.p2_input };
 
         // Step 2: Map and consume the oldest PBO (PBO_COUNT−1 frames old).
         //         By now the GPU DMA into that PBO is guaranteed complete.
@@ -430,9 +437,9 @@ void OGLHook::onBeforeSwap() {
             fn_glReadPixels(0, 0, GAME_WIDTH, GAME_HEIGHT,
                             glconst::BGRA, glconst::UNSIGNED_BYTE,
                             slot->pixels);
-            slot->frame_index = staged_frame_index;
-            slot->p1_input    = staged_p1;
-            slot->p2_input    = staged_p2;
+            slot->frame_index = tag.frame_index;
+            slot->p1_input    = tag.p1_input;
+            slot->p2_input    = tag.p2_input;
             m_encoder->ring().commitWriteSlot();
         }
     }

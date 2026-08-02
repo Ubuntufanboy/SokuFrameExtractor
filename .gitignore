@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Game data — NEVER commit
+# ---------------------------------------------------------------------------
+# The game is copyrighted and the working tree carries a multi-GB copy of an
+# extracted install (th123*.dat, th123e.exe, mods, replays, crash dumps).
+# The live prefix lives outside the repo; see README for how to point at it.
+Soku/
+*.rep
+*.dat
+*.dmp
+crashes/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build/
+build*/
+_build/
+out/
+dist/
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# ---------------------------------------------------------------------------
+# Capture output
+# ---------------------------------------------------------------------------
+soku_extract/
+*.mp4
+*.mkv
+*.bmp
+*.bgra
+*.fifo
+manifest.jsonl
+status.json
+
+# Exception: the README showcase clip is a deliberate, committed asset.
+!docs/assets/
+!docs/assets/**
+
+# ---------------------------------------------------------------------------
+# Databases / logs
+# ---------------------------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Fetched by scripts/fetch-deps.sh, not vendored.
+third_party/
