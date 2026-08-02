@@ -227,6 +227,9 @@ def cmd_start(args) -> int:
             # of a 48-thread box, capturing at 20 fps instead of 95. The swarm
             # was slower than a single job. See throttle.cpu_list.
             SFE_CPU_BLOCK=str(i),
+            # So wine.mesa_env() can size llvmpipe's thread pool against the
+            # share of the CPU budget this worker actually gets.
+            SFE_WORKERS=str(args.workers),
         )
 
         log = open(p["log"], "ab")

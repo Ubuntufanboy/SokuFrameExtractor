@@ -178,6 +178,55 @@ class Xvfb:
                     proc.kill()
 
 
+# -------------------------------------------------------------------------
+# Software rasteriser tuning
+# -------------------------------------------------------------------------
+# The game is D3D9 -> wined3d -> OpenGL -> llvmpipe, so every pixel is drawn
+# on the CPU and llvmpipe's settings are the game's frame rate.
+#
+# Nothing was set before, which left two costs on the table:
+#
+# * **Thread count.** llvmpipe sizes its rasteriser pool from the host CPU
+#   count. Inside a container that means it saw 48 and spawned ~16 threads
+#   *per game*; four concurrent games put ~64 rasteriser threads on a 5.76
+#   core quota. llvmpipe's workers spin while waiting for tiles, so an
+#   oversubscribed pool does not merely queue -- it burns quota spinning, and
+#   the cgroup was throttling 74% of scheduling periods.
+#
+# * **Vector width.** llvmpipe picks its SIMD width conservatively. This host
+#   has AVX2 and AVX-512; 256-bit is the sweet spot in practice, because the
+#   512-bit paths downclock and llvmpipe's kernels are not wide enough to pay
+#   that back.
+#
+# Both are overridable from the environment so they can be benchmarked
+# without editing code.
+def mesa_env() -> dict[str, str]:
+    """llvmpipe settings, sized for the CPU budget we actually have."""
+    env = {
+        # Force software rendering explicitly rather than relying on there
+        # being no GPU to fall back from.
+        "LIBGL_ALWAYS_SOFTWARE": "1",
+        "GALLIUM_DRIVER": "llvmpipe",
+        "MESA_NO_ERROR": "1",          # skip GL error bookkeeping we never read
+        "LP_NATIVE_VECTOR_WIDTH": "256",
+    }
+    threads = os.environ.get("SFE_LP_NUM_THREADS")
+    if threads is None:
+        # Split the real budget across the workers sharing it, so the pool
+        # matches the cores available rather than the cores visible.
+        avail = throttle.available_cpus()
+        workers = max(1, int(os.environ.get("SFE_WORKERS", "1")))
+        threads = str(max(1, avail // workers))
+    env["LP_NUM_THREADS"] = threads
+
+    # Explicit overrides win, so a benchmark can set any of these directly.
+    for k in ("LP_NUM_THREADS", "LP_NATIVE_VECTOR_WIDTH", "GALLIUM_DRIVER",
+              "LIBGL_ALWAYS_SOFTWARE", "MESA_NO_ERROR"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
+
+
 def wine_env(
     prefix: Path,
     display: int,
@@ -207,6 +256,7 @@ def wine_env(
             "WINEDLLOVERRIDES": ";".join(overrides),
         }
     )
+    env.update(mesa_env())
     if mute_audio:
         env["PULSE_SERVER"] = "/nonexistent-sfe"
         if _ASOUND_NULL_CONF.exists():
