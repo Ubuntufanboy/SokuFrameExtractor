@@ -83,8 +83,12 @@ if that matters more than fidelity does.
   code.
 - Headless rendering under Xvfb + Mesa llvmpipe (verified by screenshot).
 - **Unattended replay start** — no menus, no keypresses, no human. See below.
-- Corpus fan-out across containers: `--shard I/N` splits the replay list into
-  disjoint, complete strides.
+- Corpus fan-out: `--shard I/N` splits the replay list into disjoint, complete
+  strides, one per container or `runner/swarm.py` worker.
+- Corpus acquisition from sokureplays.delthas.fr, with ground-truth matchup
+  metadata (characters, decks, Elo, outcome).
+- Square 480x480 output inside a hard bitrate budget: **599 MB per hour of
+  footage** measured over six captures, against a 700 MB/h ceiling.
 - Recovery of legacy BMP captures into the modern layout
   (`pipeline/from_bmp.py`), and the showcase clip above, built from real
   recorded gameplay.
@@ -160,8 +164,9 @@ above injects above the kernel, so dinput never sees any of it.
 
 - `.npz` shard export for the training repo.
 - Validated matchup metadata — see `pipeline/REPPARSE_STATUS.md`.
-- A full 397-replay corpus run. The mechanism works and shards across
-  containers; it has not yet been run end to end at that scale.
+- A full corpus run to completion. The mechanism works and shards across
+  workers; throughput on the current box is bounded by a 5.76-core cgroup
+  quota, so a 52 GB target is roughly 40 hours of wall clock.
 
 ---
 
@@ -194,11 +199,30 @@ python3 -m pipeline.overlay out/<capture>/
 python3 -m pipeline.trailer out/ -o docs/assets/showcase.mp4
 ```
 
-### Fanning a corpus out across containers
+### Building a corpus from sokureplays.delthas.fr
+
+```bash
+python3 -m pipeline.fetch_replays -o corpus -n 2600
+```
+
+Pages the site's JSON backend and downloads each `.rep`, writing an
+`index.jsonl` of listing metadata beside them. That metadata is the point as
+much as the files are: it carries **characters, both 20-card decks, Elo,
+rounds and the winner**, which is ground truth for the conditioning signal the
+local `.rep` header parser could never be trusted to produce (see
+`pipeline/REPPARSE_STATUS.md`).
+
+The fetcher is deliberately unhurried — one request at a time, paced, backing
+off on errors, identifying itself, and fully resumable. Player nicknames are
+stripped by default; the corpus needs characters and decks, not identities.
+
+### Fanning a corpus out across workers
 
 `--shard I/N` gives each container a disjoint slice of the corpus. The split is
 a pure function of the sorted replay list, so the containers need no
 coordination and never collide:
+
+On a host with Docker, one container per shard:
 
 ```bash
 # 20 replays, 10 containers -> 2 each
@@ -208,6 +232,24 @@ for i in $(seq 0 9); do
     sfe-collect --prefix /prefix --out /out --shard "$i/10"
 done
 ```
+
+Without Docker — which includes any host that *is* already an unprivileged
+container — `runner/swarm.py` does the same thing with processes:
+
+```bash
+python3 -m runner.swarm start --workers 4 --prefix ~/.wine-soku \
+    --corpus corpus --out dataset --budget-gb 52
+python3 -m runner.swarm status --out dataset
+python3 -m runner.swarm stop   --out dataset
+```
+
+It clones the Wine prefix per worker (hardlinking the 2.1 GB of read-only
+`.dat` archives, so ten prefixes cost ~6.7 GB rather than ~26), partitions the
+X display numbers, and runs each worker detached with `--shard i/N`.
+
+**Size the swarm against the real CPU budget, not `nproc`.** See
+[Known issues](#a-cgroup-cpu-quota-makes-nproc-a-lie); `swarm start` prints the
+quota and warns when you oversubscribe it.
 
 Each container plays its replays one at a time, one game process each, and
 writes a `video.mp4` + `inputs.csv` pair per replay. Merge the shards by
@@ -421,6 +463,44 @@ Two consequences, both handled:
 
 `runner/menu.py` and `runner/vkbd.py` are kept as documented dead ends, not as
 part of the pipeline. Nothing calls them.
+
+### A cgroup CPU quota makes `nproc` a lie
+
+The GPU box reports 48 CPUs and is capped at **5.76**:
+
+```
+$ nproc
+48
+$ cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us   # 576000
+$ cat /sys/fs/cgroup/cpu/cpu.cfs_period_us  # 100000
+```
+
+Every core-count decision sized from `os.cpu_count()` is therefore wrong by
+8x inside a container, and the failure is not graceful. Ten workers at four
+cores each — 40 "cores" of a 48-thread machine — captured at 5 fps apiece,
+roughly *half the total throughput of a single worker*, because each one paid
+the full per-frame cost of a game process for a twentieth of a core.
+
+The diagnostic that gives it away is a contradiction:
+
+```
+$ vmstat 2
+ r  b ...  us sy id
+78  0 ...  12  9 80      <- 78 runnable tasks AND 80% idle
+```
+
+The idle is the host's; the run queue is ours.
+
+`runner/throttle.py` reads the quota (v2 `cpu.max`, v1 `cfs_quota_us`) and
+`swarm start` warns when `workers x cpus` exceeds it.
+
+**Under a quota, `taskset` is actively harmful.** Pinning exists to keep a
+run from monopolising a machine somebody is using; a quota already does that,
+and does it better, because it caps total CPU while leaving the scheduler free
+to place threads wherever there is room. `taskset` on top caps nothing further
+— it only forbids the scheduler from using idle cores. Three workers pinned
+two cores each ran 48/52/5 fps, the third starving behind a neighbour. So
+pinning is skipped whenever a quota is present.
 
 ### Xvfb rejects depth 32
 
