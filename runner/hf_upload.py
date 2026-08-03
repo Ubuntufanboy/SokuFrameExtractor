@@ -93,7 +93,30 @@ def main() -> int:
     print(f"{len(done)} captures already uploaded", flush=True)
 
     shard_bytes = int(args.shard_gb * (1 << 30))
+
+    # Shard numbering comes from what is already in the repo, not from local
+    # files. Deriving it locally is wrong in a way that destroys data: shards are
+    # deleted after upload, so a fresh run finds no local tars, restarts at
+    # 0000, and silently overwrites the shards already on the Hub. A failed
+    # upload leaving its tar behind makes the numbering wrong in the other
+    # direction too. The repo is the only authority on what exists.
+    try:
+        existing = [f for f in api.list_repo_files(args.repo, repo_type="dataset")
+                    if f.startswith(f"shards/{args.host}-")]
+    except Exception as exc:
+        print(f"cannot list {args.repo}: {exc}", file=sys.stderr)
+        return 4
+    used = set()
+    for f in existing:
+        stem = Path(f).stem                      # "C-0007"
+        try:
+            used.add(int(stem.rsplit("-", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    next_idx = max(used) + 1 if used else 0
     n_shards = 0
+    print(f"{len(existing)} shard(s) already in {args.repo} for host "
+          f"{args.host}; next index {next_idx:04d}", flush=True)
 
     while True:
         caps = [c for c in ok_captures(args.roots) if f"{c[0]}::{c[1]}" not in done]
@@ -123,9 +146,9 @@ def main() -> int:
             time.sleep(args.poll_seconds)
             continue
 
-        idx = len([p for p in args.work.glob(f"{args.host}-*.tar")]) + n_shards
-        name = f"{args.host}-{idx:04d}.tar"
+        name = f"{args.host}-{next_idx:04d}.tar"
         tar_path = args.work / name
+        tar_path.unlink(missing_ok=True)     # drop any tar left by a failed run
 
         # One tar per dataset root, since paths are relative to their own root.
         by_root: dict[Path, list[str]] = {}
@@ -168,6 +191,7 @@ def main() -> int:
 
         tar_path.unlink(missing_ok=True)
         (args.work / f"{name}.json").unlink(missing_ok=True)
+        next_idx += 1
         n_shards += 1
 
         hours = sum(f for _, _, f, _ in batch) / 60 / 3600
