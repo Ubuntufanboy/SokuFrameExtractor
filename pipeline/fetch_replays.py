@@ -158,7 +158,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-n", "--count", type=int, default=500,
                     help="how many replays to fetch (default 500)")
     ap.add_argument("--order", default="last",
-                    help="listing order (default 'last', i.e. newest first)")
+                    help="listing order (the backend appears to ignore this: "
+                         "order=first/last/elo all return identical rows)")
+    ap.add_argument("--start-offset", type=int, default=0,
+                    help="begin paging here instead of at the newest replay. "
+                         "This is how several machines build disjoint corpora "
+                         "without talking to each other: give each a range of "
+                         "the listing wide enough that they cannot meet. "
+                         "Seeding index.jsonl handles exact duplicates within "
+                         "one corpus; this avoids them between corpora.")
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY_S,
                     help=f"seconds between requests (default {DEFAULT_DELAY_S})")
     ap.add_argument("--ranked-only", action="store_true",
@@ -197,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 
     fetched = skipped = 0
     total_bytes = 0
-    offset = 0
+    offset = args.start_offset
     t0 = time.monotonic()
 
     try:
