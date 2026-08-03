@@ -17,6 +17,10 @@ SSH_OPTS="-i $KEY -o BatchMode=yes -o ConnectTimeout=25 -o StrictHostKeyChecking
 
 # label port host dataset workers live
 #
+# The original 5.76-core box (D) was deleted -- 6.7x less CPU than A for more
+# money. Its 305 captures were verified onto A first, and its unique
+# offset-60000 corpus slice backed up to A:/root/corpus-offset60000.
+#
 # `live=0` marks a directory that holds finished captures but is not being
 # written to -- A0 is the archive migrated off the original 5.76-core box. Its
 # footage counts toward the total; its *rate* must not, because dividing
@@ -28,7 +32,6 @@ HOSTS=(
   "A0 42373 184.144.255.144 /root/dataset  16 0"
   "B  18577 184.144.255.144 /root/dataset  10 1"
   "C  22653 184.144.255.144 /root/dataset   7 1"
-  "D  24358 45.135.163.226  /root/dataset   4 1"
 )
 
 CMD="${1:-status}"
@@ -53,12 +56,27 @@ for mf in glob.glob(os.path.join(root, "w*", "manifest.jsonl")):
                 pass
         else:
             fail += 1
-try:
-    el = int(subprocess.run(
-        ["bash", "-c", "ps -o etimes= -p $(pgrep -f runner.collect | head -1) | tr -d ' '"],
-        capture_output=True, text=True).stdout.strip() or 0)
-except Exception:
-    el = 0
+# Throughput is measured from the captures themselves, not from process
+# uptime. Two earlier attempts got this wrong:
+#
+#   pgrep | head -1   picked an arbitrary worker, often one restarted seconds
+#                     ago, giving 186 footage-hours per wall-hour.
+#   oldest worker     still wrong after a swarm restart, because the footage
+#                     predates the current processes: 139 h/wall-h.
+#
+# The span between the first and last capture's mtime is the wall-clock time
+# this host actually spent producing what it has, and it survives restarts.
+# It understates the rate if the host sat idle in the middle, which is the
+# safe direction for an ETA.
+vids = glob.glob(os.path.join(root, "w*", "*", "video.mp4"))
+mtimes = []
+for v in vids:
+    try:
+        mtimes.append(os.path.getmtime(v))
+    except OSError:
+        pass
+el = int(max(mtimes) - min(mtimes)) if len(mtimes) > 1 else 0
+
 alive = subprocess.run(["bash", "-c", "pgrep -fc runner.collect || true"],
                        capture_output=True, text=True).stdout.strip() or "0"
 free = subprocess.run(["bash", "-c", "df -BG --output=avail / | tail -1 | tr -dc 0-9"],
