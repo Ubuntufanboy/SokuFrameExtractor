@@ -48,37 +48,28 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
     wineserver -w
 fi
 
-# The module is built with MSVC and links the MSVC C++ runtime. Wine's BUILTIN
-# msvcp140 does not implement everything the MSVC STL calls: std::mutex and
-# std::thread reach ?_Throw_Cpp_error@std@@YAXH@Z on their failure paths, and
-# Wine aborts the process the moment that is called:
+# NO MSVC redistributable is installed, deliberately.
+#
+# This used to run `winetricks -q vcrun2019` on first launch, because Wine's
+# builtin msvcp140 does not implement everything the MSVC STL calls --
+# std::mutex and std::thread reach ?_Throw_Cpp_error@std@@YAXH@Z on their
+# failure paths, and Wine aborts the process the moment it is called:
 #
 #   wine: Call from ... to unimplemented function
 #         msvcp140.dll.?_Throw_Cpp_error@std@@YAXH@Z, aborting
 #
-# The abort happens during module load, so the symptom is a game that dies with
-# an empty SokuFrameExtractor.log -- initLog()'s fopen succeeded, but nothing
-# got as far as writing a line. It looks exactly like "the module never loaded".
+# The abort happened during module load, so the symptom was a game that died
+# with an empty SokuFrameExtractor.log: initLog()'s fopen had succeeded, but
+# nothing got as far as writing a line. It looked exactly like "the module
+# never loaded", and reading it that way cost hours.
 #
-# Installing the real redistributable fixes it. This needs network on first run
-# only; the result lives in the prefix volume.
-if [ "${SFE_SKIP_VCRUN:-0}" != "1" ] && [ ! -f "$WINEPREFIX/.vcrun-installed" ]; then
-    echo "installing MSVC runtime into the prefix (first run only) ..."
-    if command -v winetricks >/dev/null 2>&1 && \
-       winetricks -q vcrun2019 >/dev/null 2>&1; then
-        touch "$WINEPREFIX/.vcrun-installed"
-        echo "  vcrun2019 installed"
-    else
-        echo "  WARNING: could not install vcrun2019." >&2
-        echo "  The module will abort at load on ?_Throw_Cpp_error." >&2
-        echo "  Provide network on first run, or drop a native 32-bit" >&2
-        echo "  msvcp140.dll/vcruntime140.dll into" >&2
-        echo "  \$WINEPREFIX/drive_c/windows/system32/." >&2
-    fi
-fi
-
-# Prefer the native runtime over Wine's builtin once it is present.
-export WINEDLLOVERRIDES="msvcp140=n,b;vcruntime140=n,b;${WINEDLLOVERRIDES:-}"
+# The durable fix was to stop linking the MSVC STL at all -- the module uses
+# Win32 primitives (CreateThread, CRITICAL_SECTION, FILE*) directly, which took
+# it from 92,672 to 36,352 bytes. cmake/CheckNoMsvcp.cmake fails the build if
+# an MSVCP140 import ever reappears, naming the header that reintroduced it.
+#
+# So this image needs no network on first run, and the prefix needs no
+# provisioning beyond wineboot.
 
 arch=$(grep -a '^#arch' "$WINEPREFIX/system.reg" 2>/dev/null | head -1 || true)
 case "$arch" in
