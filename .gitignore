@@ -10,6 +10,10 @@ Soku/
 *.dmp
 crashes/
 
+# Installer images kept on disk for the QEMU-guest fallback (milestone 5). Multi-GB
+# and re-downloadable, so they stay out of history.
+*.iso
+
 # ---------------------------------------------------------------------------
 # Build output
 # ---------------------------------------------------------------------------
