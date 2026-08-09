@@ -394,7 +394,8 @@ void OGLHook::onBeforeSwap() {
         // with the PBO precisely because the pixels lag the tag by that many
         // frames -- reading a "current" input at map time would mislabel every
         // frame by the pipeline depth.
-        m_pbo_metadata[write_idx] = { tag.frame_index, tag.p1_input,
+        m_pbo_metadata[write_idx] = { tag.frame_index, tag.battle_frame,
+                                      tag.p1_input,
                                       tag.p2_input, tag.p1_state,
                                       tag.p2_state };
 
@@ -410,7 +411,8 @@ void OGLHook::onBeforeSwap() {
                 if (slot) {
                     memcpy(slot->pixels, ptr, FRAME_BUFFER_SIZE);
                     const auto& meta = m_pbo_metadata[read_idx];
-                    slot->frame_index = meta.frame_index;
+                    slot->frame_index  = meta.frame_index;
+                    slot->battle_frame = meta.battle_frame;
                     slot->p1_input    = meta.p1;
                     slot->p2_input    = meta.p2;
                     slot->p1_state    = meta.p1_state;
@@ -441,7 +443,8 @@ void OGLHook::onBeforeSwap() {
             fn_glReadPixels(0, 0, GAME_WIDTH, GAME_HEIGHT,
                             glconst::BGRA, glconst::UNSIGNED_BYTE,
                             slot->pixels);
-            slot->frame_index = tag.frame_index;
+            slot->frame_index  = tag.frame_index;
+            slot->battle_frame = tag.battle_frame;
             slot->p1_input    = tag.p1_input;
             slot->p2_input    = tag.p2_input;
             slot->p1_state    = tag.p1_state;

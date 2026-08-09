@@ -26,7 +26,7 @@ from pipeline import verify_state  # noqa: E402
 
 WALK = 3.0            # game units per frame, roughly Soku's walk speed
 FLOOR = 0.0
-COLUMNS = ["row", "game_frame", "p1_input", "p2_input"]
+COLUMNS = ["frame", "game_frame", "p1_input", "p2_input"]
 BUTTONS = ["up", "down", "left", "right", "a", "b", "c", "d", "change", "spell"]
 for _p in (1, 2):
     COLUMNS += [f"p{_p}_{b}" for b in BUTTONS]
@@ -34,6 +34,12 @@ for _p in (1, 2):
     COLUMNS += [f"p{_p}_x", f"p{_p}_y", f"p{_p}_dir", f"p{_p}_action",
                 f"p{_p}_guarding", f"p{_p}_wrongblock", f"p{_p}_crushed",
                 f"p{_p}_knockdown"]
+COLUMNS += ["battle_frame"]
+
+# The engine has been counting since the battle began, and capture arms some
+# way into it. A non-zero offset is the whole point of the column, so the
+# fixture has one.
+BATTLE_FRAME_OFFSET = 137
 
 
 def _script(n: int) -> list[tuple[str, str]]:
@@ -132,6 +138,7 @@ def make_capture(path: Path, n: int = 720) -> None:
                 row += [held[p][b] for b in BUTTONS]
             for p in (1, 2):
                 row += state[p]
+            row.append(i + BATTLE_FRAME_OFFSET)
             w.writerow(row)
 
 
@@ -142,7 +149,8 @@ def run(path: Path) -> dict[str, bool | None]:
               + verify_state.check_guard(rows)
               + [verify_state.check_jump(rows)]
               + verify_state.check_actions(rows)
-              + [verify_state.check_crossup(rows)])
+              + [verify_state.check_crossup(rows),
+                 verify_state.check_battle_frame(rows)])
     return {c.name: c.ok for c in checks}
 
 
@@ -234,6 +242,29 @@ def test_inverted_y_is_caught(good: Path, tmp_path: Path):
     corrupt(good, out, lambda r: r.update(
         p1_y=str(-float(r["p1_y"])), p2_y=str(-float(r["p2_y"]))))
     assert run(out)["jump_raises_y"] is False
+
+
+def test_a_battle_frame_that_is_just_the_row_number_is_caught(good: Path,
+                                                             tmp_path: Path):
+    """The exact trap this column was added to escape.
+
+    `game_frame` looked like an engine tick for the life of the project and was
+    a row counter -- identical to `frame` on all 6055 rows of a corpus capture
+    and all 6058 of a fresh one. That made an alignment check between two
+    captures vacuous: comparing 0,1,2,... to 0,1,2,... always agrees. A field
+    that mirrors the row number must therefore fail, not pass for being tidy.
+    """
+    out = tmp_path / "rowcount.csv"
+    corrupt(good, out, lambda r: r.update(battle_frame=r["frame"]))
+    assert run(out)["battle_frame"] is False
+
+
+def test_a_battle_frame_that_goes_backwards_is_caught(good: Path,
+                                                      tmp_path: Path):
+    out = tmp_path / "backwards.csv"
+    corrupt(good, out, lambda r: r.update(
+        battle_frame=str(BATTLE_FRAME_OFFSET + 720 - int(r["frame"]))))
+    assert run(out)["battle_frame"] is False
 
 
 def test_a_capture_without_state_columns_says_so(tmp_path: Path):

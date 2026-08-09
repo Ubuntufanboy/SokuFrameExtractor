@@ -49,10 +49,18 @@
 //   holding RIGHT moves x by +3.20/frame, LEFT by -4.49       (x is horizontal)
 //   93.3% of 20 136 frames have `direction` pointing at the
 //     other player                                            (direction is facing)
-//   87.9% of 1 118 guarding frames hold away from the opponent (the guard range)
+//   89-98% of guarding frames hold away from the opponent,
+//     and 97-100% of wrong-block frames, against a 46-67%
+//     base rate for holding away at all                       (the action ranges)
 //   guard occurs on 18.9% of frames holding away against 1.9%
 //     holding toward -- 10.1x                                 (not a stuck field)
 //   a grounded UP press peaks y +92.7 within 12 frames        (y is height, up)
+//
+// The guard figures are over frames where a direction was actually held. An
+// earlier revision divided by every guarding frame instead and reported
+// 84-88%, because blockstun is exactly when a player releases the stick --
+// that measured stick-release, not direction, and pushed one replay to 60.9%
+// and a false failure.
 //
 // Positions run about 40..1240, so the stage is ~1280 wide with the origin at
 // one edge, not centred. Separation reached +-1200.

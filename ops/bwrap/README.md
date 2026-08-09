@@ -45,11 +45,25 @@ Captures average 34 MB and 11 000 frames. So re-capturing the 2003-replay
 corpus is about **34 hours and 67 GB** at two workers — which is why it cannot
 happen on this box (1.3 GB free) without shard-and-upload.
 
-**Capture is not bit-deterministic.** Two runs of replay 5262777 produced
-10 073 and 10 074 frames. The CSV and video from *one* run always agree, so
-this costs nothing normally -- but it rules out the tempting shortcut of
-keeping the existing corpus videos and pairing them with freshly captured
-sidecars, because the pairing would be silently off by a frame.
+## Capture is near-deterministic, and alignable where it is not
+
+Runs of one replay differ slightly in length -- 10 073 vs 10 074 frames, or
+6055 / 6058 / 6061 across three captures of 5314129 -- because capture arms
+within a tick or so of the battle rather than on a fixed tick, and the tail
+runs a few frames past the scene change.
+
+Between two runs on this box, the state columns disagreed on **27 of 10 073
+rows (0.268%)**, worst position error 24.5 units on a 1200-wide stage, and the
+input columns on 3 rows. Against a *fleet* capture of the same replay the raw
+disagreement looked like 15.6% -- until cross-correlating the input columns
+showed a constant shift of one, which drops it to **0.132%**.
+
+So the corpus videos can be paired with freshly captured sidecars, and the
+offset has to be recovered rather than assumed. `battle_frame` (added after
+this was measured) makes that a lookup instead of an inference for any capture
+taken from now on; for the existing corpus, which has no such column, the
+input columns are the key. Require the residual mismatch under ~1% and drop
+the replay otherwise.
 
 ## Usage
 

@@ -111,6 +111,12 @@ constexpr DWORD ADDR_BATTLE_MANAGER = 0x008985E4;
 constexpr DWORD VTBL_CBATTLEMANAGER = 0x008588EC;
 constexpr DWORD ADDR_FRAME_DELAY    = 0x008A0FF8;
 
+// BattleManager + 0x004, from third_party/SokuLib/src/BattleManager.hpp. Its
+// immediate neighbours at 0x00C/0x010 are the two character managers this file
+// already dereferences correctly every frame, so the struct layout is not in
+// question here -- only whether this particular field is the counter, which
+// pipeline/verify_state.py checks by requiring it to advance monotonically.
+constexpr int BM_FRAME_COUNT_OFFSET = 0x04;
 constexpr int BM_PLAYER1_OFFSET = 0x0C;
 constexpr int BM_PLAYER2_OFFSET = 0x10;
 constexpr int CHAR_INPUT_OFFSET = 0x754;
@@ -753,8 +759,19 @@ FrameTag Session::onFrame() {
 
         // Read both players' inputs and state for the tick being presented.
         uint16_t p1 = 0, p2 = 0;
+        uint32_t battle_frame = 0;
         sfe::PlayerState p1s, p2s;
         if (void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER)) {
+            // The engine's own battle tick. Recorded because `m_frame_index`
+            // cannot identify a moment in the match: it is this capture's row
+            // number and starts at 0 wherever the capture armed, which is not
+            // the same tick every run. Two captures of replay 5314129 -- one
+            // by the collection fleet, one here -- turned out to be offset by
+            // exactly one, discoverable only by cross-correlating the input
+            // columns. With this column that alignment is read off, not
+            // inferred.
+            battle_frame = *reinterpret_cast<const uint32_t*>(
+                               reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET);
             void* p1obj = *reinterpret_cast<void**>(
                               reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
             void* p2obj = *reinterpret_cast<void**>(
@@ -768,8 +785,9 @@ FrameTag Session::onFrame() {
             p2s = sfe::readPlayerState(p2obj);
         }
 
-        tag.capture     = true;
-        tag.frame_index = m_frame_index;
+        tag.capture      = true;
+        tag.frame_index  = m_frame_index;
+        tag.battle_frame = battle_frame;
         tag.p1_input    = p1;
         tag.p2_input    = p2;
         tag.p1_state    = p1s;

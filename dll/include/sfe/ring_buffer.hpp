@@ -62,6 +62,14 @@ struct alignas(64) FrameSlot {
     int32_t  frame_index  = 0;
     uint16_t p1_input     = 0;
     uint16_t p2_input     = 0;
+    // The engine's own battle frame counter, BattleManager + 0x004. Unlike
+    // frame_index -- which is this capture's row number and therefore starts
+    // at 0 whenever the capture happened to arm -- this identifies the tick in
+    // the *match*, so two captures of one replay can be aligned to each other
+    // exactly. They need to be: capture arms within a tick or so of the battle
+    // starting, not on a fixed tick, and a run of the same replay on another
+    // machine came out shifted by one.
+    uint32_t battle_frame = 0;
 
     // Ground truth for the same tick. See sfe/player_state.hpp for why the
     // world model needs to be told these rather than asked to infer them.
@@ -69,8 +77,8 @@ struct alignas(64) FrameSlot {
     PlayerState p2_state;
 
     // Pad so the whole struct is a multiple of 64 bytes.
-    // 4 + 2 + 2 + 2*sizeof(PlayerState) = 8 + 32 = 40 → 24 bytes of pad.
-    uint32_t _pad[6];
+    // 4 + 2 + 2 + 4 + 2*sizeof(PlayerState) = 12 + 32 = 44 → 20 bytes of pad.
+    uint32_t _pad[5];
 };
 
 // Compile-time size checks. The padding above is computed from

@@ -63,8 +63,11 @@ from pathlib import Path
 # seen it. Each is loose: a correct read clears them by a wide margin, and
 # nothing near the boundary should be called a pass.
 MIN_FACING_AGREEMENT = 0.80   # chars turn to face; some frames are mid-turn
-MIN_GUARD_AWAY       = 0.70   # guard can persist a few frames after release
-MIN_WRONGBLOCK_AWAY  = 0.70   # a wrong block is a guard at the wrong HEIGHT
+# Both measured over frames where a direction was actually held; see
+# `_away_fraction`. Observed 89-98% and 97-100% across seven captures, against
+# a 46-67% base rate, so 0.80 is loose without being meaningless.
+MIN_GUARD_AWAY       = 0.80
+MIN_WRONGBLOCK_AWAY  = 0.80   # a wrong block is a guard at the wrong HEIGHT
 MIN_GUARD_CONTRAST   = 4.0    # times more guard while holding away than toward
 MIN_ACTIONS_SEEN     = 15     # a real match visits far more than this
 MAX_ACTION_ID        = 1000   # SokuLib's table ends well below this
@@ -192,11 +195,20 @@ def check_facing(rows: list[dict]) -> Check:
 
 
 def _away_fraction(rows: list[dict], flag: str) -> tuple[int, float]:
-    """Of frames where `flag` is set, how often was the away direction held?
+    """Of block frames where a direction WAS held, how often was it away?
 
     Away is defined from positions alone -- opponent to my right means away is
     left -- so this is the mechanic stated in exactly the terms the world model
     could not learn from pixels.
+
+    Frames holding neither direction (or both) are excluded, and that is not a
+    detail. Blockstun is precisely when a player lets go of the stick: the
+    block is already committed and holding it changes nothing. Counting those
+    frames as "did not hold away" measured stick-release, not direction, and
+    it dragged one replay's wrong-block figure to 60.9% -- below the threshold,
+    reported as a failing offset. With the denominator corrected, guarding runs
+    89-98% across seven captures and wrong-block 97-100%, against a base rate
+    of 46-67% for holding away at all.
     """
     hit = held = 0
     for r in rows:
@@ -206,10 +218,11 @@ def _away_fraction(rows: list[dict], flag: str) -> tuple[int, float]:
         for p, sign in ((1, 1.0), (2, -1.0)):
             if not _i(r, f"p{p}_{flag}"):
                 continue
+            left, right = _i(r, f"p{p}_left"), _i(r, f"p{p}_right")
+            if left == right:          # nothing held, or both: says nothing
+                continue
             hit += 1
-            toward_right = dx * sign > 0
-            away = _i(r, f"p{p}_left") if toward_right else _i(r, f"p{p}_right")
-            held += int(bool(away))
+            held += left if dx * sign > 0 else right
     return hit, (held / hit if hit else 0.0)
 
 
@@ -331,6 +344,70 @@ def check_actions(rows: list[dict]) -> list[Check]:
     ]
 
 
+def clock_phases(rows: list[dict]) -> list[tuple[int, int]]:
+    """Split rows into runs over which `battle_frame` increases.
+
+    `BattleManager.frameCount` is NOT a match clock. It restarts at every
+    battle sub-state, so one capture of a two-round match looks like:
+
+        rows    0..58    bf    2..60     intro (capture armed 2 ticks in)
+        rows   59..179   bf    0..120    round 1 countdown
+        rows  180..3769  bf    0..3589   round 1
+        rows 3770..4061  bf    0..291    the KO sequence
+        rows 4062..4182  bf    0..120    round 2 countdown
+        rows 4183..5657  bf    0..1474   round 2
+        rows 5658..6060  bf    0..353    results
+
+    Returns [(start_row, end_row), ...] inclusive. The run *lengths* are a
+    property of the replay rather than of the capture, which is what makes
+    them usable to align two captures of one replay.
+    """
+    bf = [_i(r, "battle_frame") for r in rows]
+    out, start = [], 0
+    for i in range(1, len(bf)):
+        if bf[i] < bf[i - 1]:
+            out.append((start, i - 1))
+            start = i
+    out.append((start, len(bf) - 1))
+    return out
+
+
+def check_battle_frame(rows: list[dict]) -> Check:
+    """`battle_frame` must be the engine's own clock, not another row counter.
+
+    That distinction is the entire reason the column exists, and it is not
+    hypothetical: `game_frame` was documented as the engine tick for the life
+    of the project and is in fact identical to `frame` on every row of every
+    capture ever taken. An alignment check built on it compares 0,1,2,... with
+    0,1,2,... and always agrees, which is how two captures of replay 5314129
+    could be a frame apart with nothing noticing.
+
+    So the test is that the column carries information the row number does not,
+    advances about one tick per row inside each phase, and resets only at phase
+    boundaries -- a handful of times, not continuously.
+    """
+    if "battle_frame" not in rows[0]:
+        return Check("battle_frame", None,
+                     "column absent; capture predates the engine clock")
+    bf = [_i(r, "battle_frame") for r in rows]
+    if all(v == i for i, v in enumerate(bf)):
+        return Check("battle_frame", False,
+                     "identical to the row index on every row, so it carries "
+                     "nothing an alignment could use")
+
+    phases = clock_phases(rows)
+    # Within a phase the clock must not run backwards, and must advance at
+    # roughly one tick per row -- the presentation can double or drop a frame,
+    # but it cannot systematically outrun or lag the engine.
+    ratios = [(bf[b] - bf[a] + 1) / (b - a + 1) for a, b in phases
+              if b - a + 1 >= 30]
+    ok = (1 <= len(phases) <= 20
+          and all(0.75 <= r <= 1.25 for r in ratios))
+    span = ", ".join(f"{b - a + 1}r/{bf[b] - bf[a] + 1}t" for a, b in phases)
+    return Check("battle_frame", ok,
+                 f"starts at {bf[0]}, {len(phases)} phases [{span}]")
+
+
 def check_crossup(rows: list[dict]) -> Check:
     signs = [1 if _f(r, "p2_x") - _f(r, "p1_x") > 0 else -1 for r in rows]
     flips = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
@@ -362,7 +439,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {summarise(rows)}\n")
         checks = (check_ranges(rows) + check_walk(rows) + [check_facing(rows)]
                   + check_guard(rows) + [check_jump(rows)]
-                  + check_actions(rows) + [check_crossup(rows)])
+                  + check_actions(rows) + [check_crossup(rows),
+                                           check_battle_frame(rows)])
         for c in checks:
             print(c.line())
         bad = [c for c in checks if c.ok is False]

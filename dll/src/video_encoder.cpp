@@ -168,7 +168,8 @@ bool VideoEncoder::openOutputs() {
           "p1_x,p1_y,p1_dir,p1_action,"
           "p1_guarding,p1_wrongblock,p1_crushed,p1_knockdown,"
           "p2_x,p2_y,p2_dir,p2_action,"
-          "p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown\n", m_csv);
+          "p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown,"
+          "battle_frame\n", m_csv);
 
     sfe::log("VideoEncoder: CSV opened %s", m_csv_path);
     return true;
@@ -225,14 +226,27 @@ void VideoEncoder::encoderLoop() {
 
         // --- 2. the CSV row describing exactly those pixels ---------------
         // `frame` is this file's own row counter, so it is dense and gap-free
-        // by construction and is what video frame N maps to.  `game_frame` is
-        // the engine tick the pixels came from; it can legitimately repeat if
-        // the game presents twice for one tick, which is why the two are
-        // recorded separately instead of assuming they agree.  Deriving the
-        // row number here, on the thread that writes the row, is also what
-        // stops it drifting -- the old code computed it as
-        // (global_frame - m_replay_start_frame) with the subtrahend owned by
-        // another thread.
+        // by construction and is what video frame N maps to.  Deriving it here,
+        // on the thread that writes the row, is what stops it drifting -- the
+        // old code computed it as (global_frame - m_replay_start_frame) with
+        // the subtrahend owned by another thread.
+        //
+        // `game_frame` was documented as "the engine tick the pixels came
+        // from, which can legitimately repeat if the game presents twice for
+        // one tick".  IT IS NOT.  It is the session's own capture counter and
+        // is equal to `frame` on every row of every capture ever taken -- 6055
+        // of 6055 on a corpus capture, 6058 of 6058 on a fresh one.  The claim
+        // went unchallenged because comparing it between two captures compares
+        // 0,1,2,... with 0,1,2,... and always agrees, which is how two
+        // captures of one replay sat a frame apart with nothing noticing.
+        //
+        // `battle_frame` is the real thing, read from BattleManager + 0x004.
+        // It does repeat and skip as described above (about 50 repeats and 5
+        // skips per match), and it restarts at every battle sub-state, so it
+        // identifies a moment within a phase rather than within the match.
+        // Both columns are kept: `game_frame` because captures in the wild
+        // have it, `battle_frame` because it is what two captures can be
+        // aligned on.
         const int   row = m_total_written.load();
         const auto  p1  = slot->p1_input;
         const auto  p2  = slot->p2_input;
@@ -244,7 +258,8 @@ void VideoEncoder::encoderLoop() {
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%.3f,%.3f,%d,%u,%d,%d,%d,%d,"
-                "%.3f,%.3f,%d,%u,%d,%d,%d,%d\n",
+                "%.3f,%.3f,%d,%u,%d,%d,%d,%d,"
+                "%u\n",
                 row, slot->frame_index,
                 static_cast<unsigned>(p1), static_cast<unsigned>(p2),
                 (p1 & INPUT_UP)     ? 1 : 0, (p1 & INPUT_DOWN)  ? 1 : 0,
@@ -267,7 +282,11 @@ void VideoEncoder::encoderLoop() {
                 s2.x, s2.y, static_cast<int>(s2.direction),
                 static_cast<unsigned>(s2.action),
                 s2.guarding ? 1 : 0, s2.wrongblock ? 1 : 0,
-                s2.crushed  ? 1 : 0, s2.knockdown  ? 1 : 0);
+                s2.crushed  ? 1 : 0, s2.knockdown  ? 1 : 0,
+                // Appended last, like every column before it: `data/soku.py`
+                // selects by name, and a corpus mixing layouts has to stay
+                // loadable.
+                static_cast<unsigned>(slot->battle_frame));
 
         m_ring.releaseReadSlot();
         m_total_written.fetch_add(1, std::memory_order_relaxed);

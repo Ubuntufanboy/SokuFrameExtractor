@@ -49,8 +49,9 @@ namespace sfe {
 #include "sfe/player_state.hpp"
 
 struct FrameTag {
-    bool     capture;      // false -> skip this frame entirely
-    int      frame_index;  // game tick this frame belongs to
+    bool     capture;       // false -> skip this frame entirely
+    int      frame_index;   // this capture's row number, from 0
+    uint32_t battle_frame;  // the engine's battle tick; see ring_buffer.hpp
     uint16_t p1_input;
     uint16_t p2_input;
     // Ground truth about both players for this same tick. It rides in the tag
@@ -166,6 +167,7 @@ private:
 
     struct PBOData {
         int      frame_index;
+        uint32_t battle_frame;
         uint16_t p1;
         uint16_t p2;
         // The player states ride here for the same reason the inputs do, and
