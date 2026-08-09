@@ -42,11 +42,18 @@ mkdir -p "$PREFIX" "$OUT" "$REPLAYS"
 # --die-with-parent so an ssh disconnect tears the whole thing down rather than
 #   stranding a game that renders forever at 100% of six cores.
 #
-# The network namespace is deliberately NOT unshared. Some SWRSToys modules
-# resolve names during load, and while only SokuFrameExtractor is enabled here,
-# a DNS timeout inside a netns with no resolver is a 30-second stall per launch
-# that looks exactly like a slow start.
+# --unshare-net (SFE_UNSHARE_NET=1, the default) also isolates ABSTRACT unix
+#   sockets, which are per network namespace and not per mount namespace. X
+#   servers bind one alongside /tmp/.X11-unix/X<n>, so without this two
+#   concurrent sandboxes collide on display :90 even though each has a private
+#   tmpfs /tmp -- the second Xvfb dies and the worker looks like a hung launch.
+#   Set SFE_UNSHARE_NET=0 if a module ever needs the network; then give each
+#   worker its own SFE_DISPLAY_BASE instead (runner/wine.py reads it).
+NET=()
+[ "${SFE_UNSHARE_NET:-1}" = "1" ] && NET=(--unshare-net)
+
 exec bwrap \
+    "${NET[@]}" \
     --bind "$ROOTFS" / \
     --proc /proc \
     --dev /dev \
