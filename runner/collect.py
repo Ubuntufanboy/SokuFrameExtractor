@@ -185,6 +185,7 @@ def capture_one(
     crf: int,
     square: int,
     verbose: bool,
+    video: bool = True,
 ) -> manifest.Entry:
     """Capture a single replay. Always returns an Entry; never raises for
     ordinary failures, because one bad replay must not end the run."""
@@ -239,6 +240,7 @@ def capture_one(
             square=square,
             log_path=out_dir / "ffmpeg.log",
             n_cpus=n_cpus,
+            video=video,
         ) as enc, wine.Xvfb() as xvfb:
             env = wine.wine_env(prefix, xvfb.display)
 
@@ -281,8 +283,22 @@ def capture_one(
                 else f"no status.json (game exited rc={rc})"
             )
         if entry.status == "ok":
-            entry.video_sha256 = _sha256(out_dir / "video.mp4")
+            if video:
+                entry.video_sha256 = _sha256(out_dir / "video.mp4")
             entry.csv_sha256 = _sha256(out_dir / "inputs.csv")
+
+        if not video:
+            # With no video there is no packet count to check the CSV against,
+            # so the drainer's own frame count takes that job. The two are
+            # produced by different processes from the same stream -- the DLL
+            # writes a row and a frame back to back, and `dd` counts the frames
+            # -- so a disagreement means one of them lost data.
+            drained = encode.drained_frames(out_dir / "ffmpeg.log")
+            entry.meta["drained_frames"] = drained
+            if drained is not None and entry.frames and drained != entry.frames:
+                entry.status = "invalid"
+                entry.reason = (f"drained {drained} frames off the FIFO but the "
+                                f"DLL reported {entry.frames}")
 
     finally:
         # Always tear the prefix down, even on an exception: a surviving game
@@ -291,9 +307,10 @@ def capture_one(
 
     # --- validate ----------------------------------------------------------
     if entry.status == "ok":
-        report = validate.validate_capture(out_dir)
+        report = validate.validate_capture(out_dir, require_video=video)
         entry.validation = report.stats
-        entry.video = str((out_dir / "video.mp4").resolve())
+        if video:
+            entry.video = str((out_dir / "video.mp4").resolve())
         entry.csv = str((out_dir / "inputs.csv").resolve())
         if not report.ok:
             entry.status = "invalid"
@@ -335,6 +352,12 @@ def main(argv: list[str] | None = None) -> int:
                          f"(default {encode.SQUARE})")
     ap.add_argument("--vaapi", action="store_true",
                     help="use GPU encoding if available")
+    ap.add_argument("--no-video", action="store_true",
+                    help="write only inputs.csv, discarding the pixels. The "
+                         "FIFO is still drained (a stalled pipe stalls the "
+                         "sidecar too), just by a counter instead of x264. For "
+                         "adding state columns to replays the corpus already "
+                         "has video for: ~1 MB a replay instead of ~34 MB.")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB,
                     help=f"refuse to start, and stop between replays, below "
                          f"this much free disk (default {MIN_FREE_GB})")
@@ -430,7 +453,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"replays  : {len(replays)}")
     print(f"output   : {args.out.resolve()}")
     print(f"cpu      : {throttle.describe(args.cpus)}")
-    print(f"encoder  : {'h264_vaapi' if vaapi else 'libx264'}")
+    sink = ("none (CSV only, FIFO drained)" if args.no_video
+            else ("h264_vaapi" if vaapi else "libx264"))
+    print(f"encoder  : {sink}")
     print(f"free disk: {free_gb(args.out):.1f} GB")
     print()
 
@@ -463,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
                 crf=args.crf,
                 square=args.square,
                 verbose=args.verbose,
+                video=not args.no_video,
             )
             manifest.append(args.out, entry)
 

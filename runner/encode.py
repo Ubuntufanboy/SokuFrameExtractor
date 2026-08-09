@@ -150,9 +150,54 @@ def build_command(
     return cmd
 
 
+# Bytes on the wire for one frame. The DLL writes BGRA at the game's native
+# size, before any scaling, so this is the raw frame and not the square output.
+FRAME_BYTES = GAME_W * GAME_H * 4
+
+
+def build_null_command(fifo: Path) -> list[str]:
+    """A drainer for when the pixels are not wanted, only the sidecar.
+
+    SOMETHING has to read the FIFO. The DLL's encoder thread writes pixels and
+    the CSV row for a frame back to back, so a pipe nobody drains does not just
+    lose video -- it stalls the sidecar too, and the DLL falls back to writing
+    raw BGRA into the output directory, which is 73 MB/s of disk.
+
+    `dd` rather than `cat` because it counts. One block per frame with
+    `iflag=fullblock` (a pipe read returns at most 64 KB, so without it the
+    records are all partial and the count is meaningless) makes `records in`
+    an exact frame count, taken from the pixel stream itself. That is what
+    keeps a cross-check against the CSV's row count once there is no video for
+    `validate.check_video` to count packets in.
+    """
+    return ["dd", f"if={fifo}", "of=/dev/null", f"bs={FRAME_BYTES}",
+            "iflag=fullblock"]
+
+
+def drained_frames(log_path: Path) -> int | None:
+    """Frames read off the FIFO, from `dd`'s summary. None if unreadable."""
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        # "6058+0 records in"; the second number counts partial blocks, which
+        # iflag=fullblock should make zero except for a truncated final frame.
+        if "records in" in line:
+            try:
+                return int(line.split("+", 1)[0].strip())
+            except ValueError:
+                return None
+    return None
+
+
 @dataclass
 class Encoder:
-    """An FFmpeg process bound to a FIFO, scoped to a `with` block."""
+    """An FFmpeg process bound to a FIFO, scoped to a `with` block.
+
+    With `video=False` the FIFO is still created and still drained, but by a
+    counter rather than an encoder -- see `build_null_command`.
+    """
 
     fifo: Path
     out_mp4: Path
@@ -161,13 +206,16 @@ class Encoder:
     square: int = SQUARE
     log_path: Path | None = None
     n_cpus: int = 0
+    video: bool = True
 
     _proc: subprocess.Popen | None = None
     _log = None
 
     def __enter__(self) -> "Encoder":
-        if not shutil.which("ffmpeg"):
+        if self.video and not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg not found on PATH")
+        if not self.video and not shutil.which("dd"):
+            raise RuntimeError("dd not found on PATH")
 
         # A stale FIFO from a killed run would silently connect the new game to
         # the old reader's leftovers.
@@ -179,13 +227,13 @@ class Encoder:
         self.out_mp4.parent.mkdir(parents=True, exist_ok=True)
 
         # x264 defaults to one thread per core and would otherwise compete with
-        # the game's software rasteriser for the same cores.
-        argv = throttle.wrap(
-            build_command(self.fifo, self.out_mp4, vaapi=self.vaapi,
-                          crf=self.crf, square=self.square,
-                          threads=self.n_cpus or 4),
-            n_cpus=self.n_cpus,
-        )
+        # the game's software rasteriser for the same cores. The drainer is
+        # pinned to the same block for consistency, though it costs nothing.
+        cmd = (build_command(self.fifo, self.out_mp4, vaapi=self.vaapi,
+                             crf=self.crf, square=self.square,
+                             threads=self.n_cpus or 4)
+               if self.video else build_null_command(self.fifo))
+        argv = throttle.wrap(cmd, n_cpus=self.n_cpus)
 
         self._log = open(self.log_path, "wb") if self.log_path else subprocess.DEVNULL
         self._proc = subprocess.Popen(

@@ -32,18 +32,29 @@ all 13 checks in `pipeline.verify_state`.
 
 ## Throughput, measured on a Ryzen 5 4500 (6 cores / 12 threads)
 
-| workers | aggregate | per replay |
-|---|---|---|
-| 1 x 6 cores | 135 fps (2.3x real time) | 66 380 frames in 490 s |
-| 2 x 6 cores | 183 fps (3.0x real time) | 90 336 frames in 495 s |
+| workers | sink | aggregate | wall clock |
+|---|---|---|---|
+| 1 x 6 cores | libx264 | 135 fps (2.3x real time) | 66 380 frames in 490 s |
+| 2 x 6 cores | libx264 | 183 fps (3.0x real time) | 90 336 frames in 495 s |
+| 2 x 6 cores | `--no-video` | **217 fps** (3.6x real time) | 90 331 frames in 417 s |
 
 A second worker buys **1.35x, not 2x**: six physical cores are already
-saturated by llvmpipe and x264, and the second worker mostly fills SMT
-siblings. Worth having, not worth planning around.
+saturated by llvmpipe, and the second worker mostly fills SMT siblings.
 
-Captures average 34 MB and 11 000 frames. So re-capturing the 2003-replay
-corpus is about **34 hours and 67 GB** at two workers — which is why it cannot
-happen on this box (1.3 GB free) without shard-and-upload.
+Dropping the encoder buys **1.19x**, which is less than it sounds like it
+should. Software-rendering the game is the cost; x264 at veryfast on a 480x480
+frame is not. So do not reach for `--no-video` for speed. Reach for it for
+size: sidecars are **1.3 MB** against 34 MB for a capture with video.
+
+The two ways to give the whole 2003-replay corpus state labels:
+
+| | time (2 workers) | disk |
+|---|---|---|
+| full re-capture | ~34 h | ~67 GB |
+| `--no-video`, paired with the existing videos | **~29 h** | **~2.6 GB** |
+
+The pixels are the same either way, so the second is the same dataset for 4%
+of the disk. What it costs is the alignment step described below.
 
 ## Capture is near-deterministic, and alignable where it is not
 
@@ -64,6 +75,12 @@ this was measured) makes that a lookup instead of an inference for any capture
 taken from now on; for the existing corpus, which has no such column, the
 input columns are the key. Require the residual mismatch under ~1% and drop
 the replay otherwise.
+
+`--no-video` keeps its own integrity check rather than losing one. There is no
+video for `validate.check_video` to count packets in, so the FIFO drainer
+counts frames instead (`dd` with one block per frame) and `collect.py` fails
+any capture where that disagrees with what the DLL reported. Across the eight
+captures above the two counts agreed exactly.
 
 ## Usage
 
