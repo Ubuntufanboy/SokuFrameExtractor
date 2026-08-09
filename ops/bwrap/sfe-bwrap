@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Run a command inside the exported Debian bookworm rootfs, unprivileged.
+#
+# This is docker/entrypoint.sh's job done with bwrap instead of a daemon; see
+# ops/bwrap/README.md for why, and docker/collect.Dockerfile for why the
+# filesystem has to be bookworm's rather than the host's.
+#
+#   sfe-bwrap python3 -m runner.collect --prefix /wineprefix --out /out --limit 1
+#   sfe-bwrap wine --version
+#   sfe-bwrap bash            # poke around inside
+set -euo pipefail
+
+ROOTFS="${SFE_ROOTFS:-$HOME/sfe-rootfs}"
+GAME="${SFE_GAME:-$HOME/sfe-game}"
+PREFIX="${SFE_PREFIX:-$HOME/sfe-prefix}"
+REPLAYS="${SFE_REPLAYS:-$HOME/sfe-replays}"
+OUT="${SFE_OUT:-$HOME/sfe-out}"
+APP="${SFE_APP:-$HOME/sfe}"
+
+# Checked by looking for the 32-bit unix loaders rather than for `wine` on
+# PATH, and that is the point rather than an implementation detail: /usr/bin/
+# wine is a symlink through /etc/alternatives that only resolves inside the
+# sandbox, and -- more importantly -- a new-WoW64 Wine has no i386-unix
+# directory at all. It runs 32-bit code through a 64-bit host process, which
+# crashes this module during load with no log to say why. So the guard asserts
+# the property the image exists to provide.
+if ! compgen -G "$ROOTFS/usr/lib/*/wine/i386-unix" >/dev/null; then
+    echo "sfe-bwrap: no 32-bit Wine (i386-unix) under $ROOTFS/usr/lib" >&2
+    echo "           run ops/bwrap/export-rootfs.sh from a machine with Docker." >&2
+    exit 2
+fi
+mkdir -p "$PREFIX" "$OUT" "$REPLAYS"
+
+# The game directory is bound read-write on purpose: runner/collect.py rewrites
+# modules/SokuFrameExtractor/SokuFrameExtractor.ini per job, and SWRSToys writes
+# currentModule.txt next to the executable.
+#
+# --unshare-pid so a wedged wineserver dies with the sandbox instead of
+#   surviving on a shared box. bwrap is pid 1 inside and reaps.
+# --unshare-ipc because Mesa and X both use SysV shm; leaking segments from a
+#   killed run is otherwise permanent until reboot.
+# --die-with-parent so an ssh disconnect tears the whole thing down rather than
+#   stranding a game that renders forever at 100% of six cores.
+#
+# The network namespace is deliberately NOT unshared. Some SWRSToys modules
+# resolve names during load, and while only SokuFrameExtractor is enabled here,
+# a DNS timeout inside a netns with no resolver is a 30-second stall per launch
+# that looks exactly like a slow start.
+exec bwrap \
+    --bind "$ROOTFS" / \
+    --proc /proc \
+    --dev /dev \
+    --tmpfs /tmp \
+    --tmpfs /dev/shm \
+    --tmpfs /run \
+    --bind "$APP" /app \
+    --bind "$GAME" /game \
+    --bind "$PREFIX" /wineprefix \
+    --bind "$OUT" /out \
+    --ro-bind "$REPLAYS" /replays \
+    --setenv HOME /wineprefix \
+    --setenv WINEPREFIX /wineprefix \
+    --setenv WINEARCH win32 \
+    --setenv WINEDEBUG -all \
+    --setenv PULSE_SERVER /nonexistent-sfe \
+    --setenv PYTHONUNBUFFERED 1 \
+    --setenv PYTHONPATH /app \
+    --setenv LIBGL_ALWAYS_SOFTWARE 1 \
+    --setenv GALLIUM_DRIVER llvmpipe \
+    --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --chdir /app \
+    --unshare-pid \
+    --unshare-ipc \
+    --die-with-parent \
+    "$@"

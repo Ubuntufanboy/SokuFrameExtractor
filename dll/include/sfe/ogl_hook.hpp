@@ -46,11 +46,19 @@ namespace sfe {
 // -------------------------------------------------------------------------
 // What the owner tells us about the frame that is about to be presented.
 // -------------------------------------------------------------------------
+#include "sfe/player_state.hpp"
+
 struct FrameTag {
     bool     capture;      // false -> skip this frame entirely
     int      frame_index;  // game tick this frame belongs to
     uint16_t p1_input;
     uint16_t p2_input;
+    // Ground truth about both players for this same tick. It rides in the tag
+    // for exactly the reason the inputs do: pixels rendered for tick N must
+    // carry tick N's state, and producing both at one point is what stops them
+    // drifting apart.
+    PlayerState p1_state;
+    PlayerState p2_state;
 };
 
 // Called once per presented frame, on the game thread, BEFORE the pixels are
@@ -160,6 +168,13 @@ private:
         int      frame_index;
         uint16_t p1;
         uint16_t p2;
+        // The player states ride here for the same reason the inputs do, and
+        // it is the whole correctness argument of this struct: pixels are read
+        // back PBO_COUNT frames late, so anything sampled at map time would be
+        // attached to the wrong frame by exactly the pipeline depth. Staging
+        // the state with the tick it belongs to is what prevents that.
+        PlayerState p1_state;
+        PlayerState p2_state;
     } m_pbo_metadata[PBO_COUNT] = {};
 
     int          m_pbo_write_idx = 0;         // slot being written this frame

@@ -156,12 +156,19 @@ bool VideoEncoder::openOutputs() {
         return false;
     }
 
+    // The state columns are appended, never inserted, so every reader written
+    // against the old header keeps working -- `data/soku.py` selects columns by
+    // name and a corpus mixing both layouts must stay loadable.
     fputs("frame,game_frame,"
           "p1_input,p2_input,"
           "p1_up,p1_down,p1_left,p1_right,"
           "p1_a,p1_b,p1_c,p1_d,p1_change,p1_spell,"
           "p2_up,p2_down,p2_left,p2_right,"
-          "p2_a,p2_b,p2_c,p2_d,p2_change,p2_spell\n", m_csv);
+          "p2_a,p2_b,p2_c,p2_d,p2_change,p2_spell,"
+          "p1_x,p1_y,p1_dir,p1_action,"
+          "p1_guarding,p1_wrongblock,p1_crushed,p1_knockdown,"
+          "p2_x,p2_y,p2_dir,p2_action,"
+          "p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown\n", m_csv);
 
     sfe::log("VideoEncoder: CSV opened %s", m_csv_path);
     return true;
@@ -229,11 +236,15 @@ void VideoEncoder::encoderLoop() {
         const int   row = m_total_written.load();
         const auto  p1  = slot->p1_input;
         const auto  p2  = slot->p2_input;
+        const auto& s1  = slot->p1_state;
+        const auto& s2  = slot->p2_state;
 
         fprintf(m_csv,
                 "%d,%d,%u,%u,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                "%.3f,%.3f,%d,%u,%d,%d,%d,%d,"
+                "%.3f,%.3f,%d,%u,%d,%d,%d,%d\n",
                 row, slot->frame_index,
                 static_cast<unsigned>(p1), static_cast<unsigned>(p2),
                 (p1 & INPUT_UP)     ? 1 : 0, (p1 & INPUT_DOWN)  ? 1 : 0,
@@ -245,7 +256,18 @@ void VideoEncoder::encoderLoop() {
                 (p2 & INPUT_LEFT)   ? 1 : 0, (p2 & INPUT_RIGHT) ? 1 : 0,
                 (p2 & INPUT_A)      ? 1 : 0, (p2 & INPUT_B)     ? 1 : 0,
                 (p2 & INPUT_C)      ? 1 : 0, (p2 & INPUT_D)     ? 1 : 0,
-                (p2 & INPUT_CHANGE) ? 1 : 0, (p2 & INPUT_SPELL) ? 1 : 0);
+                (p2 & INPUT_CHANGE) ? 1 : 0, (p2 & INPUT_SPELL) ? 1 : 0,
+                // %.3f: positions are in game units of a few hundred across the
+                // stage, so a millipixel is far below anything that matters and
+                // full float precision would only inflate the sidecar.
+                s1.x, s1.y, static_cast<int>(s1.direction),
+                static_cast<unsigned>(s1.action),
+                s1.guarding ? 1 : 0, s1.wrongblock ? 1 : 0,
+                s1.crushed  ? 1 : 0, s1.knockdown  ? 1 : 0,
+                s2.x, s2.y, static_cast<int>(s2.direction),
+                static_cast<unsigned>(s2.action),
+                s2.guarding ? 1 : 0, s2.wrongblock ? 1 : 0,
+                s2.crushed  ? 1 : 0, s2.knockdown  ? 1 : 0);
 
         m_ring.releaseReadSlot();
         m_total_written.fetch_add(1, std::memory_order_relaxed);

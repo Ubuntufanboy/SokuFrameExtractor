@@ -1,4 +1,5 @@
 #pragma once
+#include "sfe/player_state.hpp"
 // =========================================================================
 // SokuFrameExtractor — ring_buffer.hpp
 // =========================================================================
@@ -42,8 +43,13 @@ constexpr uint32_t RING_MASK = static_cast<uint32_t>(RING_CAPACITY - 1);
 // an integer number of cache lines, keeping the metadata in its own line):
 //
 //   [0 .. FRAME_BUFFER_SIZE-1]   pixels   (1,228,800 B = 19,200 × 64)
-//   [FRAME_BUFFER_SIZE .. +7]    metadata (frame_index, p1, p2)
-//   [+8 .. +63]                  padding  (fills the last metadata cache line)
+//   [FRAME_BUFFER_SIZE .. +39]   metadata (frame_index, p1, p2, both states)
+//   [+40 .. +63]                 padding  (fills the last metadata cache line)
+//
+// The two PlayerStates were added inside the *existing* 64-byte metadata line
+// rather than by growing the struct: at 1.2 MB a slot and hundreds of slots in
+// flight, an extra cache line per slot is real memory, and the static_assert
+// below is what keeps the arithmetic honest.
 //
 // sizeof(FrameSlot) == FRAME_BUFFER_SIZE + 64 == 1,228,864 B
 // -------------------------------------------------------------------------
@@ -57,12 +63,22 @@ struct alignas(64) FrameSlot {
     uint16_t p1_input     = 0;
     uint16_t p2_input     = 0;
 
+    // Ground truth for the same tick. See sfe/player_state.hpp for why the
+    // world model needs to be told these rather than asked to infer them.
+    PlayerState p1_state;
+    PlayerState p2_state;
+
     // Pad so the whole struct is a multiple of 64 bytes.
-    // sizeof(metadata fields) = 4 + 2 + 2 = 8 bytes → need 56 bytes of pad.
-    uint32_t _pad[14];
+    // 4 + 2 + 2 + 2*sizeof(PlayerState) = 8 + 32 = 40 → 24 bytes of pad.
+    uint32_t _pad[6];
 };
 
-// Compile-time size check
+// Compile-time size checks. The padding above is computed from
+// sizeof(PlayerState), so if that struct ever gains a field this fails at
+// compile time instead of silently pushing the slot over a cache line -- or,
+// worse, leaving the assert satisfied while the fields no longer line up.
+static_assert(sizeof(PlayerState) == 16,
+              "PlayerState changed size — recompute FrameSlot::_pad");
 static_assert(sizeof(FrameSlot) == FRAME_BUFFER_SIZE + 64,
               "FrameSlot size does not match expectation — check padding");
 

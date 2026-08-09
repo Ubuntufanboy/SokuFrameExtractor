@@ -9,6 +9,7 @@
 
 #include "sfe/session.hpp"
 #include "sfe/logger.hpp"
+#include "sfe/player_state.hpp"
 
 #include <shlwapi.h>
 
@@ -750,8 +751,9 @@ FrameTag Session::onFrame() {
             break;
         }
 
-        // Read both players' inputs for the tick being presented.
+        // Read both players' inputs and state for the tick being presented.
         uint16_t p1 = 0, p2 = 0;
+        sfe::PlayerState p1s, p2s;
         if (void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER)) {
             void* p1obj = *reinterpret_cast<void**>(
                               reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
@@ -759,12 +761,19 @@ FrameTag Session::onFrame() {
                               reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
             p1 = readPlayerInput(p1obj);
             p2 = readPlayerInput(p2obj);
+            // Same two objects, same tick, one more read each. Position and
+            // guard state are what the world model cannot learn from pixels --
+            // see sfe/player_state.hpp for the measurements that led here.
+            p1s = sfe::readPlayerState(p1obj);
+            p2s = sfe::readPlayerState(p2obj);
         }
 
         tag.capture     = true;
         tag.frame_index = m_frame_index;
         tag.p1_input    = p1;
         tag.p2_input    = p2;
+        tag.p1_state    = p1s;
+        tag.p2_state    = p2s;
         ++m_frame_index;
 
         // --- throughput logging ---

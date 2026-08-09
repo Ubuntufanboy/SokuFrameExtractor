@@ -17,6 +17,7 @@
 add_library(SokuFrameExtractor SHARED
     src/main.cpp
     src/session.cpp
+    src/player_state.cpp
     src/logger.cpp
     src/video_encoder.cpp
     src/ring_buffer.cpp

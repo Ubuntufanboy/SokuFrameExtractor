@@ -35,6 +35,12 @@ DEFAULT_TIMEOUT_S = 900
 
 # Refuse to start a run that would fill the disk. Captures average ~15 MB, but
 # a wedged FFmpeg writing raw BGRA can produce gigabytes.
+#
+# This is a default, not a law -- `--min-free-gb` overrides it. The headroom a
+# full-corpus fleet run needs is not the headroom a one-replay check needs, and
+# the machines where a verification run matters most are the ones with the
+# least room. What actually bounds a runaway is `--timeout`, which kills the
+# game; this only decides whether to start.
 MIN_FREE_GB = 5.0
 
 
@@ -329,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
                          f"(default {encode.SQUARE})")
     ap.add_argument("--vaapi", action="store_true",
                     help="use GPU encoding if available")
+    ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB,
+                    help=f"refuse to start, and stop between replays, below "
+                         f"this much free disk (default {MIN_FREE_GB})")
     ap.add_argument("--max-output-gb", type=float, default=0.0,
                     help="stop once this much has been written to --out "
                          "(0 = no limit). Enforced where the space is actually "
@@ -374,9 +383,9 @@ def main(argv: list[str] | None = None) -> int:
               f"disk. Pass --out somewhere on real storage.", file=sys.stderr)
         return 2
 
-    if free_gb(args.out) < MIN_FREE_GB:
+    if free_gb(args.out) < args.min_free_gb:
         print(f"error: only {free_gb(args.out):.1f} GB free at {args.out}; "
-              f"need {MIN_FREE_GB} GB", file=sys.stderr)
+              f"need {args.min_free_gb} GB (--min-free-gb)", file=sys.stderr)
         return 2
 
     replays = find_replays(replay_dir)
@@ -430,8 +439,8 @@ def main(argv: list[str] | None = None) -> int:
         for i, rep in enumerate(replays, 1):
             print(f"[{i}/{len(replays)}] {rep.name}", flush=True)
 
-            if free_gb(args.out) < MIN_FREE_GB:
-                print(f"  aborting: free space below {MIN_FREE_GB} GB")
+            if free_gb(args.out) < args.min_free_gb:
+                print(f"  aborting: free space below {args.min_free_gb} GB")
                 break
 
             if args.max_output_gb:

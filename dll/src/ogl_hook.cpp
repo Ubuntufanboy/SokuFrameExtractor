@@ -394,7 +394,9 @@ void OGLHook::onBeforeSwap() {
         // with the PBO precisely because the pixels lag the tag by that many
         // frames -- reading a "current" input at map time would mislabel every
         // frame by the pipeline depth.
-        m_pbo_metadata[write_idx] = { tag.frame_index, tag.p1_input, tag.p2_input };
+        m_pbo_metadata[write_idx] = { tag.frame_index, tag.p1_input,
+                                      tag.p2_input, tag.p1_state,
+                                      tag.p2_state };
 
         // Step 2: Map and consume the oldest PBO (PBO_COUNT−1 frames old).
         //         By now the GPU DMA into that PBO is guaranteed complete.
@@ -411,6 +413,8 @@ void OGLHook::onBeforeSwap() {
                     slot->frame_index = meta.frame_index;
                     slot->p1_input    = meta.p1;
                     slot->p2_input    = meta.p2;
+                    slot->p1_state    = meta.p1_state;
+                    slot->p2_state    = meta.p2_state;
                     m_encoder->ring().commitWriteSlot();
                 }
                 fn_glUnmapBuffer(glconst::PIXEL_PACK_BUFFER);
@@ -440,6 +444,8 @@ void OGLHook::onBeforeSwap() {
             slot->frame_index = tag.frame_index;
             slot->p1_input    = tag.p1_input;
             slot->p2_input    = tag.p2_input;
+            slot->p1_state    = tag.p1_state;
+            slot->p2_state    = tag.p2_state;
             m_encoder->ring().commitWriteSlot();
         }
     }
