@@ -52,15 +52,23 @@ def write(path: Path, rows: list[dict]) -> None:
         w.writerows(rows)
 
 
+LEAD = 10   # frames of match before the corpus capture armed
+
+
 def pair(tmp: Path, *, offset: int, old_n: int = 600, extra: int = 4,
          noise: int = 0, idle: bool = False) -> tuple[Path, Path]:
-    """A corpus capture and a fresh one whose row i is the corpus's row i-offset.
+    """A corpus capture and a fresh capture of the same match.
 
     `offset` is what `find_offset` must recover: old[i] == new[i + offset].
+    Both are cut from one underlying sequence at different starting points --
+    which is what the two real captures are -- so a negative offset (the fresh
+    capture armed later) is as constructible as a positive one.
     """
-    base = make_rows(old_n + offset + extra, idle=idle)
-    old = [dict(r) for r in base[offset:offset + old_n]]
-    new = [dict(r) for r in base]
+    assert abs(offset) <= LEAD
+    base = make_rows(LEAD + old_n + abs(offset) + extra + LEAD, idle=idle)
+    old = [dict(r) for r in base[LEAD:LEAD + old_n]]
+    start = LEAD - offset
+    new = [dict(r) for r in base[start:start + old_n + extra]]
     for i, r in enumerate(old):
         r["frame"] = r["game_frame"] = i
     for i, r in enumerate(new):
@@ -133,13 +141,51 @@ def test_an_unrelated_replay_is_refused(tmp_path: Path):
     assert not (cdir / "state.csv").exists()
 
 
-def test_a_short_fresh_capture_is_refused(tmp_path: Path):
-    """Labels that stop before the video does would train on a truncated
-    track with nothing marking where it ended."""
-    cdir, fdir = pair(tmp_path, offset=0, extra=0)
+def _truncate(fdir: Path, n: int) -> None:
     with (fdir / "inputs.csv").open(newline="") as fh:
         rows = list(csv.DictReader(fh))
-    write(fdir / "inputs.csv", rows[:-50])
+    write(fdir / "inputs.csv", rows[:-n])
+
+
+def test_a_slightly_short_tail_is_padded_and_marked(tmp_path: Path):
+    """The results screen is presented a variable number of times, so the ends
+    routinely differ by a frame or two. Measured on the real corpus: median 0,
+    p90 2, out of ~11 000. Rejecting those threw away a third of the pairs."""
+    cdir, fdir = pair(tmp_path, offset=0, extra=0)
+    _truncate(fdir, 3)
+    rec = al.align_one(cdir, fdir, "state.csv")
+    assert rec["status"] == "ok", rec
+    assert rec["pad_tail"] == 3 and rec["pad_head"] == 0
+
+    with (cdir / "state.csv").open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    with (cdir / "inputs.csv").open(newline="") as fh:
+        old = list(csv.DictReader(fh))
+    # The invariant that matters survives: one row per video frame.
+    assert len(rows) == len(old)
+    # And nothing invented is unmarked.
+    assert [r[al.VALID_COL] for r in rows[-4:]] == ["1", "0", "0", "0"]
+    assert all(r[al.VALID_COL] == "1" for r in rows[:-3])
+
+
+def test_a_negative_offset_pads_the_head_rather_than_being_refused(
+        tmp_path: Path):
+    """A fresh capture that armed a tick late still covers all but the first
+    frame. An earlier version rejected 157 real pairs for this alone."""
+    cdir, fdir = pair(tmp_path, offset=-2)
+    rec = al.align_one(cdir, fdir, "state.csv")
+    assert rec["status"] == "ok" and rec["offset"] == -2
+    assert rec["pad_head"] == 2 and rec["pad_tail"] == 0
+    with (cdir / "state.csv").open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r[al.VALID_COL] for r in rows[:3]] == ["0", "0", "1"]
+
+
+def test_a_badly_short_capture_is_still_refused(tmp_path: Path):
+    """Padding is for the ragged ends, not for a capture that stopped early.
+    One real pair was 5955 frames short; that is broken, not ragged."""
+    cdir, fdir = pair(tmp_path, offset=0, extra=0)
+    _truncate(fdir, al.MAX_PAD + 20)
     rec = al.align_one(cdir, fdir, "state.csv")
     assert rec["status"] == "incomplete_coverage", rec
     assert not (cdir / "state.csv").exists()

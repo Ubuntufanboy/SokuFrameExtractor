@@ -62,7 +62,13 @@ MAX_RESIDUAL = 0.01
 # it exists to catch replays with long idle stretches where several shifts fit
 # equally well and the evidence does not actually pick one.
 MIN_SEPARATION = 5.0
-SEARCH = 8            # +-frames; observed offsets are 0 or 1
+SEARCH = 8            # +-frames; observed offsets are 0 or -1
+# Frames that may be filled by repeating the nearest real row, total across
+# both ends. Measured over 298 real mismatched pairs the shortfall is -35..+8
+# with a median of 0 and a p90 of 2, on captures of ~11 000 frames; 60 is one
+# second, well past that and far short of the 5955-frame outlier that is a
+# genuinely broken pair.
+MAX_PAD = 60
 
 
 def read_csv(path: Path) -> tuple[list[str], list[dict]]:
@@ -98,23 +104,52 @@ def find_offset(old: list[dict], new: list[dict], *,
     return best[1], best[0], runner[0], best[2]
 
 
-def align_rows(old_n: int, new: list[dict], offset: int) -> list[dict] | None:
-    """New-capture rows re-indexed so row i is the old capture's video frame i.
+VALID_COL = "label_valid"
 
-    None when the new capture does not cover the whole video: a partial label
-    track would silently end early, and a caller cannot tell that from a short
-    replay.
+
+def align_rows(old_n: int, new: list[dict], offset: int,
+               max_pad: int) -> tuple[list[dict], int, int] | None:
+    """New rows re-indexed so row i is the old capture's video frame i.
+
+    Returns (rows, pad_head, pad_tail), or None if more than `max_pad` frames
+    would have to be invented.
+
+    THE ENDS DO NOT LINE UP, AND THAT IS NORMAL
+    -------------------------------------------
+    Capture arms and disarms a tick or so either side of the battle, and the
+    results screen is presented a variable number of times for the same 354
+    engine ticks. Measured over 298 mismatched pairs from the real corpus, the
+    shortfall runs -35 to +8 frames with a median of 0 and a 90th percentile of
+    2 -- out of about 11 000. Those frames are intro and results, not play.
+
+    An earlier version rejected every one of these, including the 157 where
+    the fresh capture actually covered the whole video and the offset merely
+    happened to be negative. Rejecting a third of the corpus over half a second
+    of post-match screen is the wrong trade.
+
+    So the uncovered frames at each end are filled by repeating the nearest
+    real row, and marked: `label_valid` is 0 on exactly those rows and 1
+    everywhere else. Row i stays video frame i -- which is the invariant the
+    whole file exists to provide -- and nothing invented is unmarked.
     """
-    if offset < 0 or old_n + offset > len(new):
-        lo, hi = offset, old_n + offset
-        if lo < 0 or hi > len(new):
-            return None
-    return [new[i + offset] for i in range(old_n)]
+    pad_head = max(0, -offset)
+    pad_tail = max(0, (old_n + offset) - len(new))
+    if pad_head + pad_tail > max_pad or not new:
+        return None
+
+    rows: list[dict] = []
+    for i in range(old_n):
+        j = i + offset
+        valid = 0 <= j < len(new)
+        src = new[min(max(j, 0), len(new) - 1)]
+        rows.append({**src, VALID_COL: 1 if valid else 0})
+    return rows, pad_head, pad_tail
 
 
 def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
               *, max_residual: float = MAX_RESIDUAL,
               min_separation: float = MIN_SEPARATION,
+              max_pad: int = MAX_PAD,
               dry_run: bool = False) -> dict:
     """Align one capture pair. Returns a record; never raises for bad data."""
     rec: dict = {"replay_id": corpus_dir.name}
@@ -142,18 +177,20 @@ def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
     if residual == 0 and runner == 0:
         return {**rec, "status": "ambiguous"}
 
-    rows = align_rows(len(old), new, offset)
-    if rows is None:
+    aligned = align_rows(len(old), new, offset, max_pad)
+    if aligned is None:
         return {**rec, "status": "incomplete_coverage"}
+    rows, pad_head, pad_tail = aligned
+    rec.update(pad_head=pad_head, pad_tail=pad_tail)
 
     if not dry_run:
-        # Written beside the video, with the same header as the fresh capture,
-        # so `sokubot.data.state.read_state` consumes it unchanged and row i is
-        # video frame i.
+        # Written beside the video, with the fresh capture's header plus
+        # `label_valid`, so `sokubot.data.state.read_state` consumes it
+        # unchanged and row i is video frame i.
         out = corpus_dir / out_name
         tmp = out.with_suffix(".part")
         with tmp.open("w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=header)
+            w = csv.DictWriter(fh, fieldnames=[*header, VALID_COL])
             w.writeheader()
             w.writerows(rows)
         tmp.rename(out)
@@ -180,6 +217,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="written into each corpus capture dir")
     ap.add_argument("--max-residual", type=float, default=MAX_RESIDUAL)
     ap.add_argument("--min-separation", type=float, default=MIN_SEPARATION)
+    ap.add_argument("--max-pad", type=int, default=MAX_PAD,
+                    help=f"frames that may be filled at the ends by repeating "
+                         f"the nearest real row, marked label_valid=0 "
+                         f"(default {MAX_PAD})")
     ap.add_argument("--report", type=Path, default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -201,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         rec = align_one(d, f, args.out_name,
                         max_residual=args.max_residual,
                         min_separation=args.min_separation,
+                        max_pad=args.max_pad,
                         dry_run=args.dry_run)
         records.append(rec)
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
@@ -218,6 +260,15 @@ def main(argv: list[str] | None = None) -> int:
     if offsets:
         print("  offsets seen:        "
               + ", ".join(f"{k:+d}: {v}" for k, v in sorted(offsets.items())))
+    padded = [r for r in records
+              if r.get("status") == "ok" and r.get("pad_head", 0)
+              + r.get("pad_tail", 0) > 0]
+    if padded:
+        worst = max(r["pad_head"] + r["pad_tail"] for r in padded)
+        total = sum(r["pad_head"] + r["pad_tail"] for r in padded)
+        print(f"  padded at the ends:  {len(padded)} captures, "
+              f"{total} frames total, worst {worst} "
+              f"(marked {VALID_COL}=0)")
     return 0 if counts.get("ok") else 1
 
 
