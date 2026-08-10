@@ -77,8 +77,17 @@ JUMP_WINDOW          = 12     # frames; Soku's prejump alone is about four
 
 
 class Check:
-    def __init__(self, name: str, ok: bool | None, detail: str):
+    def __init__(self, name: str, ok: bool | None, detail: str,
+                 stats: tuple[int, int] | None = None):
         self.name, self.ok, self.detail = name, ok, detail
+        # (numerator, denominator) for the proportion checks, so a run over
+        # many captures can POOL them. This matters more than it looks: an
+        # offset is a property of the extractor, not of one replay, and a
+        # single match where the defender let go of the stick during 74 frames
+        # of blockstun says nothing about whether CHAR_POSITION_X_OFFSET is
+        # right. Pooled over 2003 captures the same question has millions of
+        # frames behind it.
+        self.stats = stats
 
     def line(self) -> str:
         mark = "PASS" if self.ok else ("SKIP" if self.ok is None else "FAIL")
@@ -191,7 +200,8 @@ def check_facing(rows: list[dict]) -> Check:
     frac = agree / total
     return Check("faces_opponent", frac >= MIN_FACING_AGREEMENT,
                  f"{frac:.1%} of {total} frames face the opponent "
-                 f"(threshold {MIN_FACING_AGREEMENT:.0%})")
+                 f"(threshold {MIN_FACING_AGREEMENT:.0%})",
+                 stats=(agree, total))
 
 
 def _away_fraction(rows: list[dict], flag: str) -> tuple[int, float]:
@@ -235,7 +245,8 @@ def check_guard(rows: list[dict]) -> list[Check]:
     else:
         guard = Check("guard_holds_away", away >= MIN_GUARD_AWAY,
                       f"{away:.1%} of {n_guard} guarding frames hold away "
-                      f"(threshold {MIN_GUARD_AWAY:.0%})")
+                      f"(threshold {MIN_GUARD_AWAY:.0%})",
+                      stats=(round(away * n_guard), n_guard))
 
     n_wrong, wrong_away = _away_fraction(rows, "wrongblock")
     if n_wrong < 10:
@@ -245,7 +256,8 @@ def check_guard(rows: list[dict]) -> list[Check]:
         wrong = Check("wrongblock_away", wrong_away >= MIN_WRONGBLOCK_AWAY,
                       f"{wrong_away:.1%} of {n_wrong} wrong-block frames hold "
                       f"away (threshold {MIN_WRONGBLOCK_AWAY:.0%}) -- a wrong "
-                      f"block is the right direction at the wrong height")
+                      f"block is the right direction at the wrong height",
+                      stats=(round(wrong_away * n_wrong), n_wrong))
     return [guard, wrong, check_guard_contrast(rows)]
 
 
@@ -425,12 +437,74 @@ def summarise(rows: list[dict]) -> str:
     return f"{n} frames; " + ", ".join(parts)
 
 
+# Pooled thresholds. These are not the per-capture ones relaxed -- they are a
+# different question. A per-capture threshold asks "is this replay consistent
+# with the offsets", where a defender releasing the stick through 74 frames of
+# blockstun is ordinary and drags the figure down. The pooled one asks "are the
+# offsets right", over millions of frames, where the answer should be
+# overwhelming or something is wrong.
+POOLED_MIN = {"faces_opponent": 0.90, "guard_holds_away": 0.90,
+              "wrongblock_away": 0.90}
+
+
+def summarise(paths: list[Path]) -> int:
+    """One verdict for a whole corpus, pooling every capture's raw counts."""
+    pooled: dict[str, list[int]] = {}
+    per_capture: dict[str, list[float]] = {}
+    n_read = n_bad = 0
+    for path in paths:
+        try:
+            rows = read_rows(path)
+        except SystemExit as e:
+            n_bad += 1
+            print(f"unreadable: {path}: {e}", file=sys.stderr)
+            continue
+        n_read += 1
+        for c in ([check_facing(rows)] + check_guard(rows)):
+            if c.stats is None or c.stats[1] == 0:
+                continue
+            num, den = c.stats
+            acc = pooled.setdefault(c.name, [0, 0])
+            acc[0] += num
+            acc[1] += den
+            per_capture.setdefault(c.name, []).append(num / den)
+
+    print(f"pooled over {n_read} captures" + (f" ({n_bad} unreadable)"
+                                              if n_bad else ""))
+    print(f"\n  {'check':<18} {'pooled':>8} {'frames':>12}   "
+          f"{'per-capture p5':>14} {'p50':>7}")
+    ok = True
+    for name, (num, den) in sorted(pooled.items()):
+        v = sorted(per_capture[name])
+        p5 = v[int(len(v) * 0.05)] if v else float("nan")
+        p50 = v[len(v) // 2] if v else float("nan")
+        frac = num / den
+        floor = POOLED_MIN.get(name, 0.0)
+        ok &= frac >= floor
+        mark = "" if frac >= floor else "   <-- BELOW %.0f%%" % (floor * 100)
+        print(f"  {name:<18} {frac:7.2%} {den:12,}   {p5:13.1%} {p50:6.1%}{mark}")
+
+    print("\n" + ("The offsets are consistent with the inputs across the whole "
+                  "corpus." if ok else
+                  "A POOLED figure is below its floor. That is not per-capture "
+                  "noise; check the offsets."))
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Check the state columns against the input columns.")
     ap.add_argument("csv", type=Path, nargs="+",
                     help="inputs.csv from a capture (or several)")
+    ap.add_argument("--summary", action="store_true",
+                    help="pool the proportion checks across every capture and "
+                         "report one verdict instead of one per capture. This "
+                         "is the right instrument for a corpus: see the note "
+                         "on Check.stats.")
     args = ap.parse_args(argv)
+
+    if args.summary:
+        return summarise(args.csv)
 
     failed = 0
     for path in args.csv:
