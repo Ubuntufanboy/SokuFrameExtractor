@@ -95,7 +95,10 @@ def test_the_offset_is_recovered(tmp_path: Path, offset: int):
 def test_the_written_file_is_indexed_by_video_frame(tmp_path: Path):
     """Row i of the output must be video frame i, which is the entire point."""
     cdir, fdir = pair(tmp_path, offset=3)
-    assert al.align_one(cdir, fdir, "state.csv")["status"] == "ok"
+    # full columns: this check IS the input columns, so lean would drop the
+    # evidence it needs.
+    assert al.align_one(cdir, fdir, "state.csv",
+                        lean=False)["status"] == "ok"
 
     with (cdir / "inputs.csv").open(newline="") as fh:
         old = list(csv.DictReader(fh))
@@ -195,3 +198,35 @@ def test_dry_run_writes_nothing(tmp_path: Path):
     cdir, fdir = pair(tmp_path, offset=1)
     assert al.align_one(cdir, fdir, "state.csv", dry_run=True)["status"] == "ok"
     assert not (cdir / "state.csv").exists()
+
+
+def test_the_default_output_is_lean_and_gzipped(tmp_path: Path):
+    """The corpus already holds the input columns beside the video, and the
+    machine this runs on has 1.1 GB free against 1.42 GB of full sidecars. So
+    the default drops what is duplicated and compresses the rest -- but it must
+    keep every column `read_state` needs, or the labels are unreadable."""
+    import gzip
+
+    cdir, fdir = pair(tmp_path, offset=0)
+    assert al.align_one(cdir, fdir, "state.csv.gz")["status"] == "ok"
+    out = cdir / "state.csv.gz"
+    assert out.exists()
+
+    with gzip.open(out, "rt", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    for col in (*al.STATE_COLS, al.VALID_COL):
+        assert col in rows[0], f"lean output dropped {col}"
+    # ...and none of the columns the corpus capture already has.
+    assert not any(c in rows[0] for c in al.INPUT_COLS)
+
+    full = tmp_path / "full.csv"
+    with full.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=HEADER)
+        w.writeheader()
+        w.writerows(rows_of(cdir))
+    assert out.stat().st_size < full.stat().st_size / 3
+
+
+def rows_of(d: Path) -> list[dict]:
+    with (d / "inputs.csv").open(newline="") as fh:
+        return list(csv.DictReader(fh))

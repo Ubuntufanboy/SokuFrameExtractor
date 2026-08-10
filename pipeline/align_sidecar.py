@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -106,6 +107,14 @@ def find_offset(old: list[dict], new: list[dict], *,
 
 VALID_COL = "label_valid"
 
+# What a lean output keeps. The input columns are already in the corpus's own
+# inputs.csv, so copying them alongside the video would duplicate 0.34 MB a
+# replay -- 0.7 GB over the corpus -- to say something already on disk. These
+# are exactly the columns sokubot.data.state.read_state reads.
+STATE_COLS = tuple(f"p{p}_{c}" for p in (1, 2) for c in
+                   ("x", "y", "dir", "action", "guarding", "wrongblock",
+                    "crushed", "knockdown"))
+
 
 def align_rows(old_n: int, new: list[dict], offset: int,
                max_pad: int) -> tuple[list[dict], int, int] | None:
@@ -150,6 +159,7 @@ def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
               *, max_residual: float = MAX_RESIDUAL,
               min_separation: float = MIN_SEPARATION,
               max_pad: int = MAX_PAD,
+              lean: bool = True,
               dry_run: bool = False) -> dict:
     """Align one capture pair. Returns a record; never raises for bad data."""
     rec: dict = {"replay_id": corpus_dir.name}
@@ -184,13 +194,20 @@ def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
     rec.update(pad_head=pad_head, pad_tail=pad_tail)
 
     if not dry_run:
-        # Written beside the video, with the fresh capture's header plus
-        # `label_valid`, so `sokubot.data.state.read_state` consumes it
-        # unchanged and row i is video frame i.
+        # Written beside the video so `sokubot.data.state.read_state` consumes
+        # it directly and row i is video frame i.
+        #
+        # Lean and gzipped by default because the arithmetic is stark: the full
+        # sidecar is 0.71 MB a replay, 1.42 GB over the corpus, against 1.1 GB
+        # free on the machine this was built for. State columns only is 0.73 GB
+        # and gzipped about 0.1 GB. Nothing is lost -- the dropped columns are
+        # the inputs, which the corpus capture beside this file already has.
+        cols = ([*STATE_COLS, VALID_COL] if lean else [*header, VALID_COL])
         out = corpus_dir / out_name
-        tmp = out.with_suffix(".part")
-        with tmp.open("w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=[*header, VALID_COL])
+        tmp = out.with_name(out.name + ".part")
+        opener = gzip.open if out_name.endswith(".gz") else open
+        with opener(tmp, "wt", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
         tmp.rename(out)
@@ -213,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="corpus root (a dir of worker dirs, or of captures)")
     ap.add_argument("--fresh", type=Path, nargs="+", required=True,
                     help="output trees from the --no-video re-capture")
-    ap.add_argument("--out-name", default="state.csv",
+    ap.add_argument("--out-name", default="state.csv.gz",
                     help="written into each corpus capture dir")
     ap.add_argument("--max-residual", type=float, default=MAX_RESIDUAL)
     ap.add_argument("--min-separation", type=float, default=MIN_SEPARATION)
@@ -221,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"frames that may be filled at the ends by repeating "
                          f"the nearest real row, marked label_valid=0 "
                          f"(default {MAX_PAD})")
+    ap.add_argument("--full-columns", action="store_true",
+                    help="keep the fresh capture's input columns too. They are "
+                         "already in the corpus inputs.csv beside this file, "
+                         "and keeping them triples the output.")
     ap.add_argument("--report", type=Path, default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -243,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                         max_residual=args.max_residual,
                         min_separation=args.min_separation,
                         max_pad=args.max_pad,
+                        lean=not args.full_columns,
                         dry_run=args.dry_run)
         records.append(rec)
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
