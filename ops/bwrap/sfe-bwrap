@@ -52,6 +52,26 @@ mkdir -p "$PREFIX" "$OUT" "$REPLAYS"
 NET=()
 [ "${SFE_UNSHARE_NET:-1}" = "1" ] && NET=(--unshare-net)
 
+# SFE_LIVE=1 swaps the synthetic /dev for the real one and shares the host's X
+# socket, which is what a live match needs and a capture run must NOT have.
+#
+# Capture drives the game from inside the process (session.cpp calls the
+# game's own replay handlers), so it wants no input devices at all -- and
+# `setBattleMode` faults on an EMPTY device list, which is why the replay
+# start code sets the selector to -2. A live match is the opposite: the
+# virtual pad is created on the host by play_match, and Wine's dinput
+# enumerates /dev/input ONCE at startup, so the game must see the real device
+# tree at launch or the pad does not exist for the rest of the session.
+LIVE=()
+if [ "${SFE_LIVE:-0}" = "1" ]; then
+    # Placed AFTER --dev and --tmpfs /tmp in the argument list below, because
+    # bwrap applies mounts in order and the last one wins: listed first, the
+    # synthetic /dev would be remounted over the real one and the pad would
+    # vanish again.
+    LIVE=(--dev-bind /dev /dev --bind /tmp/.X11-unix /tmp/.X11-unix)
+    NET=()          # a live match talks to the policy server
+fi
+
 exec bwrap \
     "${NET[@]}" \
     --bind "$ROOTFS" / \
@@ -65,6 +85,7 @@ exec bwrap \
     --bind "$PREFIX" /wineprefix \
     --bind "$OUT" /out \
     --ro-bind "$REPLAYS" /replays \
+    "${LIVE[@]}" \
     --setenv HOME /wineprefix \
     --setenv WINEPREFIX /wineprefix \
     --setenv WINEARCH win32 \
