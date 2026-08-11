@@ -72,8 +72,24 @@ SEARCH = 8            # +-frames; observed offsets are 0 or -1
 MAX_PAD = 60
 
 
+def sidecar(directory: Path) -> Path | None:
+    """The capture's input CSV, compressed or not.
+
+    Fresh state-only runs gzip the sidecar as they go -- at 8-11x that is what
+    makes a full corpus fit on the box that captures it -- while the corpus
+    captured before that change has plain files. Both have to be readable here
+    or the alignment can only run on half the data it exists to join.
+    """
+    for name in ("inputs.csv", "inputs.csv.gz"):
+        p = directory / name
+        if p.exists():
+            return p
+    return None
+
+
 def read_csv(path: Path) -> tuple[list[str], list[dict]]:
-    with path.open(newline="") as fh:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", newline="") as fh:
         reader = csv.DictReader(fh)
         return list(reader.fieldnames or []), list(reader)
 
@@ -163,10 +179,13 @@ def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
               dry_run: bool = False) -> dict:
     """Align one capture pair. Returns a record; never raises for bad data."""
     rec: dict = {"replay_id": corpus_dir.name}
+    old_path, new_path = sidecar(corpus_dir), sidecar(fresh_dir)
+    if old_path is None or new_path is None:
+        return {**rec, "status": "unreadable", "detail": "no inputs.csv[.gz]"}
     try:
-        _, old = read_csv(corpus_dir / "inputs.csv")
-        header, new = read_csv(fresh_dir / "inputs.csv")
-    except (OSError, csv.Error) as e:
+        _, old = read_csv(old_path)
+        header, new = read_csv(new_path)
+    except (OSError, csv.Error, EOFError) as e:
         return {**rec, "status": "unreadable", "detail": str(e)}
 
     missing = [c for c in INPUT_COLS if c not in header]
@@ -219,7 +238,7 @@ def index_fresh(dirs: list[Path]) -> dict[str, Path]:
     out: dict[str, Path] = {}
     for root in dirs:
         for child in sorted(root.iterdir()) if root.is_dir() else []:
-            if (child / "inputs.csv").exists():
+            if child.is_dir() and sidecar(child) is not None:
                 out[child.name] = child
     return out
 

@@ -783,6 +783,11 @@ FrameTag Session::onFrame() {
             // see sfe/player_state.hpp for the measurements that led here.
             p1s = sfe::readPlayerState(p1obj);
             p2s = sfe::readPlayerState(p2obj);
+            // Bullets, in a second pass because each player's are ranked by
+            // how close they are to the OTHER player -- the one being shot at
+            // -- and that position is only known once both states are read.
+            sfe::readProjectiles(p1obj, p2s.x, p2s.y, &p1s);
+            sfe::readProjectiles(p2obj, p1s.x, p1s.y, &p2s);
         }
 
         tag.capture      = true;

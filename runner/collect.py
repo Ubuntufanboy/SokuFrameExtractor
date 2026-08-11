@@ -98,6 +98,37 @@ def _sha256(path: Path) -> str | None:
         return None
 
 
+def _gzip_in_place(path: Path) -> Path:
+    """Replace `path` with `path.gz`, streaming.
+
+    Worth the CPU by a wide margin. The sidecar is mostly repeated integers and
+    zero-filled projectile slots, and it compresses 8-11x on real captures --
+    5.0 MB to 454 KB, 6.4 MB to 765 KB. Over 2003 replays that is the
+    difference between about 11 GB and about 1.1 GB, on a box with 3.2 GB free.
+
+    Compression happens on the collector's own thread between replays, where
+    the game is not running and the cores are idle anyway, so it costs no
+    capture throughput.
+
+    The original is unlinked only once the compressed file is closed, so an
+    interrupted run leaves the plain file intact rather than a truncated .gz.
+    """
+    import gzip
+
+    out = path.with_suffix(path.suffix + ".gz")
+    tmp = out.with_suffix(".gz.part")
+    try:
+        with open(path, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                dst.write(chunk)
+        tmp.replace(out)
+        path.unlink()
+        return out
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return path
+
+
 def used_gb(path: Path) -> float:
     """Bytes written under `path`, in GB.
 
@@ -186,6 +217,7 @@ def capture_one(
     square: int,
     verbose: bool,
     video: bool = True,
+    gzip_csv: bool = False,
 ) -> manifest.Entry:
     """Capture a single replay. Always returns an Entry; never raises for
     ordinary failures, because one bad replay must not end the run."""
@@ -316,6 +348,13 @@ def capture_one(
             entry.status = "invalid"
             entry.reason = "; ".join(f.detail for f in report.errors)
 
+    # --- compress ----------------------------------------------------------
+    # After validation, never before: validate.py reads the plain file, and a
+    # capture that is going to be rejected should be rejected on exactly the
+    # bytes the DLL wrote.
+    if gzip_csv and entry.status == "ok":
+        entry.csv = str(_gzip_in_place(out_dir / "inputs.csv"))
+
     return entry
 
 
@@ -358,6 +397,11 @@ def main(argv: list[str] | None = None) -> int:
                          "sidecar too), just by a counter instead of x264. For "
                          "adding state columns to replays the corpus already "
                          "has video for: ~1 MB a replay instead of ~34 MB.")
+    ap.add_argument("--gzip-csv", action="store_true",
+                    help="gzip inputs.csv after validating it (8-11x on real "
+                         "captures). For state-only runs over the full corpus, "
+                         "where the uncompressed sidecars do not fit on the "
+                         "box that has to hold them.")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB,
                     help=f"refuse to start, and stop between replays, below "
                          f"this much free disk (default {MIN_FREE_GB})")
@@ -489,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
                 square=args.square,
                 verbose=args.verbose,
                 video=not args.no_video,
+                gzip_csv=args.gzip_csv,
             )
             manifest.append(args.out, entry)
 

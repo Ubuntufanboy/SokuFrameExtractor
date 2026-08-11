@@ -1,5 +1,7 @@
 #include "sfe/player_state.hpp"
 
+#include <windows.h>   // SEH around the projectile walk
+
 namespace sfe {
 
 namespace {
@@ -68,6 +70,130 @@ PlayerState readPlayerState(void* char_obj) {
     s.knockdown  = (a == ACT_KNOCKED_DOWN || a == ACT_KNOCKED_DOWN_STATIC
                     || a == ACT_GRABBED);
     return s;
+}
+
+// -------------------------------------------------------------------------
+// Projectiles
+// -------------------------------------------------------------------------
+namespace {
+
+// The raw pointer walk, kept in its own leaf function for two reasons. It is
+// the only code in the capture that follows pointers it did not get from a
+// fixed address, so it is the only code that can fault on a stale object -- and
+// __try/__except cannot live in a function that has anything needing unwinding,
+// which is why everything here is a POD and the output is a caller-supplied
+// array.
+//
+// Selection happens INSIDE the walk rather than over a scratch copy, so the
+// counts are exact over the whole list however long it is. A scratch buffer
+// would have had to be as large as the longest list to keep `hb` honest, and
+// the longest list measured is 213 -- at which point the buffer is the thing
+// being sized by guesswork instead of the output.
+//
+// Returns the total number of objects on the list (which may far exceed `cap`),
+// writing the best `cap` of them into `out` ordered danger-first. Returns -1 if
+// any dereference faulted.
+int walkProjectiles(const char* base, ProjectileState* out, int cap,
+                    float tx, float ty, uint32_t* raw_size, int* hb_count) {
+    int total = 0, kept = 0;
+    *raw_size = 0;
+    *hb_count = 0;
+
+    // Sort keys, parallel to `out`. Tier 0 is "has a live hitbox", so the
+    // comparison is lexicographic on (tier, distance) and one memory-cheap
+    // insertion keeps the array ordered.
+    float   keyd[MAX_PROJECTILES];
+    uint8_t keyt[MAX_PROJECTILES];
+
+    __try {
+        const char* mgr = rd<const char*>(base, CHAR_OBJLIST_OFFSET);
+        if (!mgr) return 0;
+
+        const char* lst  = mgr + OBJLIST_LIST_OFFSET;
+        const char* head = rd<const char*>(lst, LIST_HEAD_OFFSET);
+        const uint32_t size = rd<uint32_t>(lst, LIST_SIZE_OFFSET);
+        if (!head || size == 0) return 0;
+        *raw_size = size;
+        // Refuse rather than follow. A plausible-looking but wrong pointer
+        // gives a huge size here, and walking it is how a capture wedges.
+        if (size > PROJ_LIST_SANITY) return 0;
+
+        // head is a sentinel node; the first real element is head->next, and
+        // the list is circular, so arriving back at head ends it.
+        const char* node = rd<const char*>(head, NODE_NEXT_OFFSET);
+        for (uint32_t k = 0; k < size && node && node != head; ++k) {
+            const char* obj = rd<const char*>(node, NODE_VAL_OFFSET);
+            node = rd<const char*>(node, NODE_NEXT_OFFSET);
+            if (!obj) continue;
+            ++total;
+
+            const float px = rd<float>(obj, CHAR_POSITION_X_OFFSET);
+            const float py = rd<float>(obj, CHAR_POSITION_Y_OFFSET);
+            const uint8_t hb = rd<uint8_t>(obj, CHAR_HITBOX_COUNT_OFFSET);
+            if (hb) ++*hb_count;
+
+            const uint8_t tier = hb ? 0 : 1;
+            const float ddx = px - tx, ddy = py - ty;
+            const float dist = ddx * ddx + ddy * ddy;   // squared: rank only
+
+            // Worse than everything already kept, and the array is full.
+            if (kept == cap
+                && (keyt[cap - 1] < tier
+                    || (keyt[cap - 1] == tier && keyd[cap - 1] <= dist)))
+                continue;
+
+            int pos = (kept < cap) ? kept : cap - 1;   // overwrite = discard
+            while (pos > 0
+                   && (keyt[pos - 1] > tier
+                       || (keyt[pos - 1] == tier && keyd[pos - 1] > dist))) {
+                out[pos]  = out[pos - 1];
+                keyd[pos] = keyd[pos - 1];
+                keyt[pos] = keyt[pos - 1];
+                --pos;
+            }
+            out[pos].x  = px;
+            out[pos].y  = py;
+            out[pos].vx = rd<float>(obj, CHAR_SPEED_X_OFFSET);
+            out[pos].vy = rd<float>(obj, CHAR_SPEED_Y_OFFSET);
+            out[pos].action    = rd<uint16_t>(obj, CHAR_ACTION_OFFSET);
+            out[pos].direction = rd<int8_t>(obj, CHAR_DIRECTION_OFFSET);
+            out[pos].hitboxes  = hb;
+            keyd[pos] = dist;
+            keyt[pos] = tier;
+            if (kept < cap) ++kept;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    return total;
+}
+
+inline uint8_t clamp255(int v) {
+    return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+}  // namespace
+
+void readProjectiles(void* char_obj, float target_x, float target_y,
+                     PlayerState* out) {
+    if (!out) return;
+    out->projectiles = 0;
+    out->proj_hb     = 0;
+    out->proj_raw    = 0;
+    for (int k = 0; k < MAX_PROJECTILES; ++k) out->proj[k] = ProjectileState{};
+    if (!char_obj) return;
+
+    uint32_t raw = 0;
+    int hb = 0;
+    const int found = walkProjectiles(reinterpret_cast<const char*>(char_obj),
+                                      out->proj, MAX_PROJECTILES,
+                                      target_x, target_y, &raw, &hb);
+    // Record the reported length even on a refusal or a fault, so the sidecar
+    // distinguishes "no objects" from "the walk declined to follow this".
+    out->proj_raw = clamp255(static_cast<int>(raw > 255u ? 255u : raw));
+    if (found <= 0) return;   // -1 is a faulted walk: report no objects
+    out->projectiles = clamp255(found);
+    out->proj_hb     = clamp255(hb);
 }
 
 }  // namespace sfe

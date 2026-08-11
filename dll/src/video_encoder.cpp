@@ -167,7 +167,23 @@ bool VideoEncoder::openOutputs() {
           "p2_a,p2_b,p2_c,p2_d,p2_change,p2_spell,"
           "p1_x,p1_y,p1_vx,p1_vy,p1_ax,p1_ay,p1_dir,p1_action,p1_action_frame,p1_hitstop,p1_untech,p1_hitboxes,p1_hurtboxes,p1_hit_count,p1_hp,p1_spirit,p1_max_spirit,p1_spirit_delay,p1_timestop,p1_ground_dashes,p1_air_dashes,p1_correction,p1_combo_rate,p1_combo_hits,p1_combo_damage,p1_combo_limit,p1_guarding,p1_wrongblock,p1_crushed,p1_knockdown,"
           "p2_x,p2_y,p2_vx,p2_vy,p2_ax,p2_ay,p2_dir,p2_action,p2_action_frame,p2_hitstop,p2_untech,p2_hitboxes,p2_hurtboxes,p2_hit_count,p2_hp,p2_spirit,p2_max_spirit,p2_spirit_delay,p2_timestop,p2_ground_dashes,p2_air_dashes,p2_correction,p2_combo_rate,p2_combo_hits,p2_combo_damage,p2_combo_limit,p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown,"
-          "battle_frame\n", m_csv);
+          "battle_frame", m_csv);
+
+    // Projectile columns, appended after everything that already existed so no
+    // reader written against the previous header has to change. Emitted in a
+    // loop rather than spelled out because MAX_PROJECTILES is the only place
+    // the width is decided -- a literal header here would silently disagree
+    // with the row writer the first time that constant moves.
+    for (int p = 1; p <= 2; ++p) {
+        fprintf(m_csv, ",p%d_proj_n,p%d_proj_hb,p%d_proj_raw", p, p, p);
+        for (int k = 0; k < MAX_PROJECTILES; ++k) {
+            fprintf(m_csv,
+                    ",p%d_pr%d_x,p%d_pr%d_y,p%d_pr%d_vx,p%d_pr%d_vy,"
+                    "p%d_pr%d_dir,p%d_pr%d_act,p%d_pr%d_hb",
+                    p, k, p, k, p, k, p, k, p, k, p, k, p, k);
+        }
+    }
+    fputc('\n', m_csv);
 
     sfe::log("VideoEncoder: CSV opened %s", m_csv_path);
     return true;
@@ -257,7 +273,7 @@ void VideoEncoder::encoderLoop() {
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u,%d,%.4f,%u,%u,%u,%d,%d,%d,%d,"
                 "%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u,%d,%.4f,%u,%u,%u,%d,%d,%d,%d,"
-                "%u\n",
+                "%u",   // no newline: the projectile columns follow below
                 row, slot->frame_index,
                 static_cast<unsigned>(p1), static_cast<unsigned>(p2),
                 (p1 & INPUT_UP)     ? 1 : 0, (p1 & INPUT_DOWN)  ? 1 : 0,
@@ -320,6 +336,26 @@ void VideoEncoder::encoderLoop() {
                 s2.guarding ? 1 : 0, s2.wrongblock ? 1 : 0,
                 s2.crushed  ? 1 : 0, s2.knockdown  ? 1 : 0,
                 static_cast<unsigned>(slot->battle_frame));
+
+        // Bullets. Slots past the live count are written as zeros rather than
+        // left empty so every row has the same width -- a ragged CSV is the
+        // kind of thing that parses fine for 10 000 rows and then does not.
+        for (int p = 0; p < 2; ++p) {
+            const auto& s = p ? s2 : s1;
+            fprintf(m_csv, ",%u,%u,%u",
+                    static_cast<unsigned>(s.projectiles),
+                    static_cast<unsigned>(s.proj_hb),
+                    static_cast<unsigned>(s.proj_raw));
+            for (int k = 0; k < MAX_PROJECTILES; ++k) {
+                const auto& pr = s.proj[k];
+                fprintf(m_csv, ",%.3f,%.3f,%.4f,%.4f,%d,%u,%u",
+                        pr.x, pr.y, pr.vx, pr.vy,
+                        static_cast<int>(pr.direction),
+                        static_cast<unsigned>(pr.action),
+                        static_cast<unsigned>(pr.hitboxes));
+            }
+        }
+        fputc('\n', m_csv);
 
         m_ring.releaseReadSlot();
         m_total_written.fetch_add(1, std::memory_order_relaxed);

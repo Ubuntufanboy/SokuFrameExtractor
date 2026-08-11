@@ -89,8 +89,14 @@ struct alignas(64) FrameSlot {
 // the old hand-padding was really protecting. A slot is 1.2 MB of pixels and
 // hundreds are in flight, so metadata under one kilobyte is free; anything
 // approaching the pixel buffer would mean a field was added by mistake.
-static_assert(sizeof(FrameSlot) - FRAME_BUFFER_SIZE < 1024,
-              "FrameSlot metadata is over 1 KB per slot -- did a field grow "
+// Raised from 1 KB to 2 KB when each player gained 24 projectile slots at 20
+// bytes apiece. That is a deliberate 960-byte growth per player, not an
+// accident, and it costs 512 * ~1.2 KB = 0.6 MB against a 600 MB ring. The
+// assert still does its job: it is a tripwire for a field that grew without
+// anyone deciding it should, and the number moves only when someone changes it
+// on purpose.
+static_assert(sizeof(FrameSlot) - FRAME_BUFFER_SIZE < 2048,
+              "FrameSlot metadata is over 2 KB per slot -- did a field grow "
               "unintentionally? Hundreds of slots are in flight.");
 static_assert(sizeof(FrameSlot) % 64 == 0,
               "FrameSlot must stay a multiple of 64 bytes");
