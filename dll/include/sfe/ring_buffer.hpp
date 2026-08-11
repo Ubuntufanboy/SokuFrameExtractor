@@ -76,19 +76,24 @@ struct alignas(64) FrameSlot {
     PlayerState p1_state;
     PlayerState p2_state;
 
-    // Pad so the whole struct is a multiple of 64 bytes.
-    // 4 + 2 + 2 + 4 + 2*sizeof(PlayerState) = 12 + 32 = 44 → 20 bytes of pad.
-    uint32_t _pad[5];
+    // No hand-computed padding any more. `alignas(64)` on the struct already
+    // rounds the total up to a multiple of 64, and the metadata grew from 44
+    // bytes to a couple of hundred when PlayerState went from four fields to
+    // twenty-six. A hand-maintained _pad[] would have to be recomputed on
+    // every such change and is exactly the kind of arithmetic that is wrong
+    // silently -- the previous assert pinned sizeof(PlayerState) == 16 for
+    // that reason, and it did its job by failing here.
 };
 
-// Compile-time size checks. The padding above is computed from
-// sizeof(PlayerState), so if that struct ever gains a field this fails at
-// compile time instead of silently pushing the slot over a cache line -- or,
-// worse, leaving the assert satisfied while the fields no longer line up.
-static_assert(sizeof(PlayerState) == 16,
-              "PlayerState changed size — recompute FrameSlot::_pad");
-static_assert(sizeof(FrameSlot) == FRAME_BUFFER_SIZE + 64,
-              "FrameSlot size does not match expectation — check padding");
+// The metadata must stay small relative to the pixels, which is the property
+// the old hand-padding was really protecting. A slot is 1.2 MB of pixels and
+// hundreds are in flight, so metadata under one kilobyte is free; anything
+// approaching the pixel buffer would mean a field was added by mistake.
+static_assert(sizeof(FrameSlot) - FRAME_BUFFER_SIZE < 1024,
+              "FrameSlot metadata is over 1 KB per slot -- did a field grow "
+              "unintentionally? Hundreds of slots are in flight.");
+static_assert(sizeof(FrameSlot) % 64 == 0,
+              "FrameSlot must stay a multiple of 64 bytes");
 
 // =========================================================================
 class RingBuffer {

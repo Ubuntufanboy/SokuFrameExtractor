@@ -1,80 +1,81 @@
 // Per-tick ground truth about both players, read from game memory.
 //
-// WHY THIS EXISTS
-// ---------------
-// The world model is trained from pixels and inputs, and it does not learn
-// where the characters are. Measured in SokuBot with `scripts/spatial_probe.py`:
-// mirroring the play area horizontally while holding the HUD fixed is
-// undetectable from the encoder's latent (AUC 0.540 against a 0.956 ceiling),
-// and the predictor's damage forecast is the same whether the defender holds
-// LEFT or RIGHT. Guarding in Hisoutensoku is holding *away from the opponent*,
-// so a model that cannot see which side the opponent is on cannot represent
-// blocking -- which is the mechanic the whole matchup runs through.
+// WHY THIS FILE GREW
+// ------------------
+// The first version logged position, facing and the guard flags, to fix a world
+// model that could not represent blocking. It did not fix it. Five objectives
+// failed against the same representation -- JEPA, inverse dynamics,
+// class-balanced IDM, direct dx supervision over 2003 replays, and a
+// play-area-mirror augmentation built specifically to forbid the HUD shortcut.
+// The spatial probe never moved past 0.62 against a 0.958 ceiling, and the
+// reward stayed flat in the one dimension the mechanic lives in: forcing the
+// defender to hold AWAY rather than TOWARD was worth -0.00025 +- 0.00761.
 //
-// Two objectives have now failed to recover it from pixels alone at this scale:
-// plain JEPA prediction, and JEPA plus an inverse-dynamics term. Both improved
-// the representation; neither made guarding predict less damage.
+// The conclusion drawn from that is architectural. The model no longer predicts
+// latents of pixels at all: the state below IS the representation, the rollout
+// happens in it, and the encoder's whole job is to read it off the screen. An
+// encoder cannot drop the fighters when the fighters are the target, and
+// "away" is expressible because it is a subtraction of two coordinates.
 //
-// So this stops asking the model to infer what the game can simply be asked.
-// The constraint the project runs under is unchanged and is about *inference*:
-// the policy at play time consumes pixels and its own inputs, nothing else.
-// These labels never reach it. They train a world model, which is the same
-// asymmetric arrangement the HUD head already uses -- the difference is only
-// that the HUD is legible in pixels and position is not.
-//
-// NO NEW GAMEPLAY IS NEEDED
-// -------------------------
-// Captures are driven by .rep files, so the existing corpus can be re-run to
-// produce these labels for frames we already have. The pixels do not change;
-// only the sidecar gains columns.
+// So this logs everything the game will tell us, in ONE pass. A capture of the
+// 2003-replay corpus costs about 29 hours; leaving a field out to be tidy buys
+// nothing and risks paying that again. Anything plausibly useful is here.
 //
 // OFFSETS
 // -------
-// All from third_party/SokuLib/src/CharacterManager.hpp, which documents them
-// inline against the game's own ADDR_* names. They are offsets into the
-// character object that `BattleManager + 0x0C / 0x10` points at -- the same
-// object `readPlayerInput` already reads at 0x754. Absolute addresses are only
-// valid for the build `CheckVersion()` accepts; these are *relative* and so
-// depend only on the struct layout, which is why they are safer than the
-// scene-pointer constants above them.
+// Every one is documented inline in third_party/SokuLib/src/CharacterManager.hpp
+// against the game's own ADDR_* names, and they are offsets into the character
+// object that `BattleManager + 0x0C / 0x10` points at -- the same object
+// `readPlayerInput` reads at 0x754. They are *relative*, so they depend only on
+// the struct layout rather than on the build CheckVersion() accepts.
 //
-// VERIFIED AGAINST THE RUNNING GAME, 2026-08-08
-// ---------------------------------------------
-// A documented offset that is wrong reads a neighbouring field and produces
-// numbers of exactly the right shape, which nothing downstream would reject.
-// So they were checked against the input columns, which have been trusted
-// since the first capture -- `pipeline/verify_state.py`, on a 10 073-frame
-// capture of replay 5262777:
+// VERIFIED AGAINST THE RUNNING GAME, 2026-08-08 (the original four)
+// -----------------------------------------------------------------
+// pipeline/verify_state.py, over six replays and 66 380 frames:
 //
-//   holding RIGHT moves x by +3.20/frame, LEFT by -4.49       (x is horizontal)
-//   93.3% of 20 136 frames have `direction` pointing at the
-//     other player                                            (direction is facing)
-//   89-98% of guarding frames hold away from the opponent,
-//     and 97-100% of wrong-block frames, against a 46-67%
-//     base rate for holding away at all                       (the action ranges)
-//   guard occurs on 18.9% of frames holding away against 1.9%
-//     holding toward -- 10.1x                                 (not a stuck field)
-//   a grounded UP press peaks y +92.7 within 12 frames        (y is height, up)
+//   holding RIGHT moves x by +1.9..+3.7/frame, LEFT by -1.0..-4.5
+//   90.6-95.3% of frames have `direction` pointing at the opponent
+//   89-98% of guarding frames hold away, 97-100% of wrong-block frames
+//   guard is 4.9x-13.1x commoner while holding away than toward
+//   a grounded UP press peaks y +92.7 within twelve frames
 //
-// The guard figures are over frames where a direction was actually held. An
-// earlier revision divided by every guarding frame instead and reported
-// 84-88%, because blockstun is exactly when a player releases the stick --
-// that measured stick-release, not direction, and pushed one replay to 60.9%
-// and a false failure.
-//
-// Positions run about 40..1240, so the stage is ~1280 wide with the origin at
-// one edge, not centred. Separation reached +-1200.
+// The fields added since are NOT yet verified against the game. Every one of
+// them needs a prediction in verify_state.py before it is trained on -- a wrong
+// offset reads a neighbouring field and produces numbers of exactly the right
+// shape, which is how this file's own history reads.
 #pragma once
 
 #include <cstdint>
 
 namespace sfe {
 
-// Offsets into the character object. Cited above; do not re-derive by guessing.
+// ---- offsets into the character object -----------------------------------
 constexpr int CHAR_POSITION_X_OFFSET = 0x0EC;  // float
 constexpr int CHAR_POSITION_Y_OFFSET = 0x0F0;  // float
+constexpr int CHAR_SPEED_X_OFFSET    = 0x0F4;  // float, per tick
+constexpr int CHAR_SPEED_Y_OFFSET    = 0x0F8;  // float
+constexpr int CHAR_GRAVITY_X_OFFSET  = 0x0FC;  // float; the acceleration term
+constexpr int CHAR_GRAVITY_Y_OFFSET  = 0x100;  // float
 constexpr int CHAR_DIRECTION_OFFSET  = 0x104;  // int8: which way the char faces
 constexpr int CHAR_ACTION_OFFSET     = 0x13C;  // uint16: SokuLib::Action
+constexpr int CHAR_FRAME_COUNT_OFFSET = 0x144; // uint32: frames into the action
+constexpr int CHAR_HP_OFFSET         = 0x184;  // int16, exact -- not the HUD
+constexpr int CHAR_HIT_COUNT_OFFSET  = 0x194;  // int8
+constexpr int CHAR_HITSTOP_OFFSET    = 0x196;  // uint16
+constexpr int CHAR_HITBOX_COUNT_OFFSET  = 0x1CB;  // uint8: >0 means ATTACKING
+constexpr int CHAR_HURTBOX_COUNT_OFFSET = 0x1CC;  // uint8
+constexpr int CHAR_GROUND_DASH_OFFSET = 0x49A; // uint8
+constexpr int CHAR_AIR_DASH_OFFSET    = 0x49B; // uint8
+constexpr int CHAR_SPIRIT_OFFSET      = 0x49E; // uint16, exact -- probe R2 0.26
+constexpr int CHAR_MAX_SPIRIT_OFFSET  = 0x4A0; // uint16
+constexpr int CHAR_SPIRIT_DELAY_OFFSET = 0x4A2; // uint16
+constexpr int CHAR_TIMESTOP_OFFSET    = 0x4A8; // uint16
+constexpr int CHAR_CORRECTION_OFFSET  = 0x4AD; // int8: damage correction
+constexpr int CHAR_COMBO_RATE_OFFSET  = 0x4B0; // float
+constexpr int CHAR_COMBO_HITS_OFFSET  = 0x4B4; // uint16
+constexpr int CHAR_COMBO_DAMAGE_OFFSET = 0x4B6; // uint16
+constexpr int CHAR_COMBO_LIMIT_OFFSET = 0x4B8; // uint16
+constexpr int CHAR_UNTECH_OFFSET      = 0x4BA; // uint16: frames until recovery
 
 // Action ranges that matter, from third_party/SokuLib/src/Action.hpp. These are
 // the mechanic itself, not a proxy for it: the attacker's whole game is to make
@@ -94,20 +95,47 @@ constexpr uint16_t ACT_KNOCKED_DOWN     = 97;   // ..98
 constexpr uint16_t ACT_KNOCKED_DOWN_STATIC = 98;
 constexpr uint16_t ACT_GRABBED          = 100;
 
-// One player's state for one tick. Deliberately flat and small: it is written
-// to the sidecar CSV once per frame per player, and the encoder's ring buffer
-// copies it, so anything that allocates here would be paid 43 million times.
+// One player's state for one tick. Deliberately flat and POD: it is written to
+// the sidecar once per frame per player and copied through the ring buffer, so
+// anything that allocates here would be paid 43 million times.
 struct PlayerState {
+    // --- kinematics: the whole reason for the redesign --------------------
     float    x = 0.0f;
     float    y = 0.0f;
+    float    vx = 0.0f;          // the game's own speed, not a difference
+    float    vy = 0.0f;
+    float    ax = 0.0f;          // gravity/acceleration term
+    float    ay = 0.0f;
     int8_t   direction = 0;
+
+    // --- what the character is doing --------------------------------------
     uint16_t action = 0;
-    // Derived, so the training side does not have to carry the action table.
-    // `guarding` is *correct* guard only; `wrongblock` and `crushed` are the
-    // two ways guarding fails, and telling them apart is the point -- one is a
-    // false positive in gap detection and the other a false negative.
-    bool guarding   = false;
-    bool wrongblock = false;
+    uint32_t action_frame = 0;   // frames into the current action
+    uint16_t hitstop = 0;
+    uint16_t untech = 0;         // frames before they can act again
+    uint8_t  hitboxes = 0;       // >0 means an active attack exists RIGHT NOW
+    uint8_t  hurtboxes = 0;
+    int8_t   hit_count = 0;
+
+    // --- resources --------------------------------------------------------
+    int16_t  hp = 0;             // exact; the HUD probe managed R2 0.9
+    uint16_t spirit = 0;         // exact; the HUD probe managed R2 0.26
+    uint16_t max_spirit = 0;
+    uint16_t spirit_delay = 0;
+    uint16_t timestop = 0;
+    uint8_t  ground_dashes = 0;
+    uint8_t  air_dashes = 0;
+    int8_t   correction = 0;
+
+    // --- combo in flight --------------------------------------------------
+    float    combo_rate = 0.0f;
+    uint16_t combo_hits = 0;
+    uint16_t combo_damage = 0;
+    uint16_t combo_limit = 0;
+
+    // --- derived, so the training side does not carry the action table ----
+    bool guarding   = false;     // correct guard, ground or air
+    bool wrongblock = false;     // right direction, wrong height
     bool crushed    = false;
     bool knockdown  = false;
 };

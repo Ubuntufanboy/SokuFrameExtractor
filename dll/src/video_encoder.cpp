@@ -165,10 +165,8 @@ bool VideoEncoder::openOutputs() {
           "p1_a,p1_b,p1_c,p1_d,p1_change,p1_spell,"
           "p2_up,p2_down,p2_left,p2_right,"
           "p2_a,p2_b,p2_c,p2_d,p2_change,p2_spell,"
-          "p1_x,p1_y,p1_dir,p1_action,"
-          "p1_guarding,p1_wrongblock,p1_crushed,p1_knockdown,"
-          "p2_x,p2_y,p2_dir,p2_action,"
-          "p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown,"
+          "p1_x,p1_y,p1_vx,p1_vy,p1_ax,p1_ay,p1_dir,p1_action,p1_action_frame,p1_hitstop,p1_untech,p1_hitboxes,p1_hurtboxes,p1_hit_count,p1_hp,p1_spirit,p1_max_spirit,p1_spirit_delay,p1_timestop,p1_ground_dashes,p1_air_dashes,p1_correction,p1_combo_rate,p1_combo_hits,p1_combo_damage,p1_combo_limit,p1_guarding,p1_wrongblock,p1_crushed,p1_knockdown,"
+          "p2_x,p2_y,p2_vx,p2_vy,p2_ax,p2_ay,p2_dir,p2_action,p2_action_frame,p2_hitstop,p2_untech,p2_hitboxes,p2_hurtboxes,p2_hit_count,p2_hp,p2_spirit,p2_max_spirit,p2_spirit_delay,p2_timestop,p2_ground_dashes,p2_air_dashes,p2_correction,p2_combo_rate,p2_combo_hits,p2_combo_damage,p2_combo_limit,p2_guarding,p2_wrongblock,p2_crushed,p2_knockdown,"
           "battle_frame\n", m_csv);
 
     sfe::log("VideoEncoder: CSV opened %s", m_csv_path);
@@ -257,8 +255,8 @@ void VideoEncoder::encoderLoop() {
                 "%d,%d,%u,%u,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                "%.3f,%.3f,%d,%u,%d,%d,%d,%d,"
-                "%.3f,%.3f,%d,%u,%d,%d,%d,%d,"
+                "%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u,%d,%.4f,%u,%u,%u,%d,%d,%d,%d,"
+                "%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u,%d,%.4f,%u,%u,%u,%d,%d,%d,%d,"
                 "%u\n",
                 row, slot->frame_index,
                 static_cast<unsigned>(p1), static_cast<unsigned>(p2),
@@ -275,17 +273,52 @@ void VideoEncoder::encoderLoop() {
                 // %.3f: positions are in game units of a few hundred across the
                 // stage, so a millipixel is far below anything that matters and
                 // full float precision would only inflate the sidecar.
-                s1.x, s1.y, static_cast<int>(s1.direction),
+                s1.x, s1.y, s1.vx, s1.vy, s1.ax, s1.ay,
+                static_cast<int>(s1.direction),
                 static_cast<unsigned>(s1.action),
+                static_cast<unsigned>(s1.action_frame),
+                static_cast<unsigned>(s1.hitstop),
+                static_cast<unsigned>(s1.untech),
+                static_cast<unsigned>(s1.hitboxes),
+                static_cast<unsigned>(s1.hurtboxes),
+                static_cast<int>(s1.hit_count),
+                static_cast<int>(s1.hp),
+                static_cast<unsigned>(s1.spirit),
+                static_cast<unsigned>(s1.max_spirit),
+                static_cast<unsigned>(s1.spirit_delay),
+                static_cast<unsigned>(s1.timestop),
+                static_cast<unsigned>(s1.ground_dashes),
+                static_cast<unsigned>(s1.air_dashes),
+                static_cast<int>(s1.correction),
+                s1.combo_rate,
+                static_cast<unsigned>(s1.combo_hits),
+                static_cast<unsigned>(s1.combo_damage),
+                static_cast<unsigned>(s1.combo_limit),
                 s1.guarding ? 1 : 0, s1.wrongblock ? 1 : 0,
                 s1.crushed  ? 1 : 0, s1.knockdown  ? 1 : 0,
-                s2.x, s2.y, static_cast<int>(s2.direction),
+                s2.x, s2.y, s2.vx, s2.vy, s2.ax, s2.ay,
+                static_cast<int>(s2.direction),
                 static_cast<unsigned>(s2.action),
+                static_cast<unsigned>(s2.action_frame),
+                static_cast<unsigned>(s2.hitstop),
+                static_cast<unsigned>(s2.untech),
+                static_cast<unsigned>(s2.hitboxes),
+                static_cast<unsigned>(s2.hurtboxes),
+                static_cast<int>(s2.hit_count),
+                static_cast<int>(s2.hp),
+                static_cast<unsigned>(s2.spirit),
+                static_cast<unsigned>(s2.max_spirit),
+                static_cast<unsigned>(s2.spirit_delay),
+                static_cast<unsigned>(s2.timestop),
+                static_cast<unsigned>(s2.ground_dashes),
+                static_cast<unsigned>(s2.air_dashes),
+                static_cast<int>(s2.correction),
+                s2.combo_rate,
+                static_cast<unsigned>(s2.combo_hits),
+                static_cast<unsigned>(s2.combo_damage),
+                static_cast<unsigned>(s2.combo_limit),
                 s2.guarding ? 1 : 0, s2.wrongblock ? 1 : 0,
                 s2.crushed  ? 1 : 0, s2.knockdown  ? 1 : 0,
-                // Appended last, like every column before it: `data/soku.py`
-                // selects by name, and a corpus mixing layouts has to stay
-                // loadable.
                 static_cast<unsigned>(slot->battle_frame));
 
         m_ring.releaseReadSlot();
