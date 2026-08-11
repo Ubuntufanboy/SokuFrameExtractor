@@ -39,10 +39,21 @@
 //   guard is 4.9x-13.1x commoner while holding away than toward
 //   a grounded UP press peaks y +92.7 within twelve frames
 //
-// The fields added since are NOT yet verified against the game. Every one of
-// them needs a prediction in verify_state.py before it is trained on -- a wrong
-// offset reads a neighbouring field and produces numbers of exactly the right
-// shape, which is how this file's own history reads.
+// THE ADDED FIELDS ARE VERIFIED TOO, 2026-08-11
+// ---------------------------------------------
+// pipeline/verify_extended.py, on a 10 076-frame capture. Each check is a
+// relationship the field could not satisfy by accident, not a plausibility
+// test:
+//
+//   world dx tracks vx * direction at err 1.59 against 6.20 for the world
+//     frame -- which is how the facing convention above was found
+//   action_frame advances on 92-94% of same-action ticks and RESETS on 100%
+//     of 506 action changes
+//   the opponent's hp fell on 97.3% of the 112 ticks where combo_damage rose
+//     -- this one couples three offsets across two players
+//   hitstop follows an active hitbox 68 times and precedes it once
+//   0 of 20 152 frames violate 0 <= spirit <= max_spirit
+//   hp spans exactly [0, 10000] from a 10000 start
 #pragma once
 
 #include <cstdint>
@@ -52,7 +63,13 @@ namespace sfe {
 // ---- offsets into the character object -----------------------------------
 constexpr int CHAR_POSITION_X_OFFSET = 0x0EC;  // float
 constexpr int CHAR_POSITION_Y_OFFSET = 0x0F0;  // float
-constexpr int CHAR_SPEED_X_OFFSET    = 0x0F4;  // float, per tick
+// FACING-RELATIVE, not world space. Measured on a real capture: world dx
+// against vx has a mean error of 6.20 where mean |dx| is 4.51, and against
+// vx * direction it is 1.59 -- four times better and unambiguous. The training
+// side MUST multiply by `direction`; a velocity whose sign flips with facing
+// makes "moving away" unlearnable, which is the exact failure this redesign
+// exists to escape.
+constexpr int CHAR_SPEED_X_OFFSET    = 0x0F4;  // float, per tick, facing-frame
 constexpr int CHAR_SPEED_Y_OFFSET    = 0x0F8;  // float
 constexpr int CHAR_GRAVITY_X_OFFSET  = 0x0FC;  // float; the acceleration term
 constexpr int CHAR_GRAVITY_Y_OFFSET  = 0x100;  // float
