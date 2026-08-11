@@ -123,13 +123,32 @@ def find_offset(old: list[dict], new: list[dict], *,
 
 VALID_COL = "label_valid"
 
-# What a lean output keeps. The input columns are already in the corpus's own
-# inputs.csv, so copying them alongside the video would duplicate 0.34 MB a
-# replay -- 0.7 GB over the corpus -- to say something already on disk. These
-# are exactly the columns sokubot.data.state.read_state reads.
-STATE_COLS = tuple(f"p{p}_{c}" for p in (1, 2) for c in
-                   ("x", "y", "dir", "action", "guarding", "wrongblock",
-                    "crushed", "knockdown"))
+# What a lean output DROPS, rather than what it keeps.
+#
+# This was a hardcoded keep-list of eight columns per player, and it went stale
+# the moment the sidecar grew: the extractor now writes 26 state fields and 24
+# projectile slots per player, and a keep-list naming the original eight would
+# have silently thrown all of it away at the alignment step -- after a 17-hour
+# capture, with the loss visible only as "the model has no projectile inputs".
+#
+# Stated as a drop-list computed from the header, it cannot go stale again.
+# What is dropped is exactly what the corpus's own inputs.csv already holds
+# beside the video: the twenty button columns, the packed input words, and the
+# two frame counters that index this capture rather than the match. Everything
+# else is state, and state is the entire reason this file runs.
+#
+# `battle_frame` is deliberately NOT dropped: it identifies the tick within the
+# match, which is what makes two captures of one replay comparable at all.
+_BUTTONS = ("up", "down", "left", "right", "a", "b", "c", "d", "change", "spell")
+DROP_COLS = frozenset(
+    ("frame", "game_frame", "p1_input", "p2_input")
+    + tuple(f"p{p}_{b}" for p in (1, 2) for b in _BUTTONS)
+)
+
+
+def lean_cols(header: list[str]) -> list[str]:
+    """The state columns of `header`, in their original order."""
+    return [c for c in header if c not in DROP_COLS]
 
 
 def align_rows(old_n: int, new: list[dict], offset: int,
@@ -217,11 +236,10 @@ def align_one(corpus_dir: Path, fresh_dir: Path, out_name: str,
         # it directly and row i is video frame i.
         #
         # Lean and gzipped by default because the arithmetic is stark: the full
-        # sidecar is 0.71 MB a replay, 1.42 GB over the corpus, against 1.1 GB
-        # free on the machine this was built for. State columns only is 0.73 GB
-        # and gzipped about 0.1 GB. Nothing is lost -- the dropped columns are
+        # sidecar is 5.5 MB a replay uncompressed, against a few GB free on the
+        # machine this was built for. Nothing is lost -- the dropped columns are
         # the inputs, which the corpus capture beside this file already has.
-        cols = ([*STATE_COLS, VALID_COL] if lean else [*header, VALID_COL])
+        cols = ([*lean_cols(header), VALID_COL] if lean else [*header, VALID_COL])
         out = corpus_dir / out_name
         tmp = out.with_name(out.name + ".part")
         opener = gzip.open if out_name.endswith(".gz") else open

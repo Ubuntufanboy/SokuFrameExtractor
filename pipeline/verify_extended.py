@@ -255,29 +255,43 @@ def check_untech(rows):
     The check was therefore measuring how much of each match was spent on the
     ground.
 
-    The causal statement is the one worth testing anyway: untech is the counter
-    that starts when you get hit. So this looks at the ticks where a player's
-    combo_damage rises -- they connected -- and requires their OPPONENT's
-    untech to be running within a few frames. That ties three offsets together
-    across both players and has no dependence on match flow.
+    The replacement asked whether the victim's untech is NON-ZERO after a hit
+    and read 100% on every replay -- which turned out to be nearly vacuous. The
+    field is non-zero on 66% of all frames anyway (it holds its value rather
+    than counting down; see player_state.hpp), so a high rate after hits says
+    little. A base rate that high is exactly the thing a pass/fail check has to
+    be measured against.
+
+    So this asks whether untech RISES at the moment of the hit. A counter that
+    is written when damage lands must increase then; one that merely happens to
+    be non-zero most of the time will not, and the contrast against the same
+    quantity on non-hit ticks is reported so the base rate is visible rather
+    than assumed.
     """
-    hit = agree = 0
     W = 4
+    hit = rose = 0
+    ctrl = ctrl_rose = 0
     for k in range(len(rows) - W):
         a, b = rows[k], rows[k + 1]
         if int(b["battle_frame"]) - int(a["battle_frame"]) != 1:
             continue
         for me, them in ((1, 2), (2, 1)):
-            if i(b, f"p{me}_combo_damage") <= i(a, f"p{me}_combo_damage"):
-                continue
-            hit += 1
-            agree += int(any(i(rows[j], f"p{them}_untech") > 0
-                             for j in range(k + 1, k + 1 + W)))
+            landed = i(b, f"p{me}_combo_damage") > i(a, f"p{me}_combo_damage")
+            base = i(a, f"p{them}_untech")
+            up = any(i(rows[j], f"p{them}_untech") > base
+                     for j in range(k + 1, k + 1 + W))
+            if landed:
+                hit += 1
+                rose += int(up)
+            else:
+                ctrl += 1
+                ctrl_rose += int(up)
     if hit < 20:
         return Check("untech_on_hit", None, f"only {hit} landed hits")
-    return Check("untech_on_hit", agree / hit > 0.8,
-                 f"the player who was hit had untech running within {W} frames "
-                 f"on {agree/hit:.1%} of {hit} landed hits")
+    r_hit, r_ctrl = rose / hit, ctrl_rose / max(ctrl, 1)
+    return Check("untech_on_hit", r_hit > 2.0 * r_ctrl,
+                 f"untech rose after {r_hit:.1%} of {hit} landed hits vs "
+                 f"{r_ctrl:.1%} of {ctrl} other ticks")
 
 
 # ---------------------------------------------------------------------------
@@ -334,32 +348,54 @@ def check_proj_owner(rows, slots):
 
     The walk starts at `charObj + 0x6F8`, so the one thing most likely to be
     wrong is whose list it is -- a shared list, or the two swapped, would
-    produce numbers that look entirely reasonable. This settles it by contrast
-    rather than by threshold: for every tick where a player's live count rises,
-    ask whether that player pressed an attack button in the preceding window,
-    and whether the OPPONENT did. If the list were attached to the wrong
-    player, the second rate would be the higher one.
+    produce numbers that look entirely reasonable. This settles it by asking,
+    for every tick where a player's object count rises, whether THAT player had
+    just pressed an attack button, and whether the OPPONENT had.
+
+    AS A LIFT, NOT AS A RAW RATE
+    ----------------------------
+    Comparing the two raw rates is confounded by how button-happy each player
+    is: against an opponent who attacks constantly, "the opponent had pressed
+    recently" is true most of the time whoever the bullets belong to. One
+    replay in nine read 44.8% against 43.9% for that reason, on data whose
+    other projectile checks pass decisively.
+
+    So each rate is divided by that same player's own unconditional press rate
+    over the replay. A lift of 1.0 means the spawn told us nothing about that
+    player; the owner's lift has to beat the opponent's. This is the same base
+    rate correction the untech check needed, and for the same reason.
     """
     W = 30
     own = opp = tot = 0
+    base = {1: 0, 2: 0}
+    ticks = 0
     for k in range(W, len(rows) - 1):
         a, b = rows[k], rows[k + 1]
         if int(b["battle_frame"]) - int(a["battle_frame"]) != 1:
             continue
+        win = rows[k - W:k + 1]
+        pressed = {p: any(i(r, f"p{p}_{btn}") for r in win
+                          for btn in ATTACK_BUTTONS) for p in (1, 2)}
+        ticks += 1
+        for p in (1, 2):
+            base[p] += int(pressed[p])
         for me, them in ((1, 2), (2, 1)):
             if i(b, f"p{me}_proj_n") <= i(a, f"p{me}_proj_n"):
                 continue
             tot += 1
-            win = rows[k - W:k + 1]
-            own += int(any(i(r, f"p{me}_{btn}") for r in win
-                           for btn in ATTACK_BUTTONS))
-            opp += int(any(i(r, f"p{them}_{btn}") for r in win
-                           for btn in ATTACK_BUTTONS))
-    if tot < 30:
+            own += int(pressed[me])
+            opp += int(pressed[them])
+    if tot < 30 or ticks < 100:
         return Check("proj_owner", None, f"only {tot} spawn ticks")
-    return Check("proj_owner", own > opp,
-                 f"owner had pressed an attack before {own/tot:.1%} of {tot} "
-                 f"spawns, opponent before {opp/tot:.1%}")
+    # Both players contribute spawns, so the pooled denominator is the mean of
+    # the two per-player base rates.
+    b_rate = (base[1] + base[2]) / (2 * ticks)
+    if b_rate <= 0:
+        return Check("proj_owner", None, "no attack presses in this replay")
+    lift_own, lift_opp = (own / tot) / b_rate, (opp / tot) / b_rate
+    return Check("proj_owner", lift_own > lift_opp,
+                 f"lift {lift_own:.2f} for the owner vs {lift_opp:.2f} for the "
+                 f"opponent over {tot} spawns (base rate {b_rate:.1%})")
 
 
 def check_proj_speed(rows, slots):

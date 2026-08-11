@@ -92,7 +92,16 @@ constexpr int CHAR_COMBO_RATE_OFFSET  = 0x4B0; // float
 constexpr int CHAR_COMBO_HITS_OFFSET  = 0x4B4; // uint16
 constexpr int CHAR_COMBO_DAMAGE_OFFSET = 0x4B6; // uint16
 constexpr int CHAR_COMBO_LIMIT_OFFSET = 0x4B8; // uint16
-constexpr int CHAR_UNTECH_OFFSET      = 0x4BA; // uint16: frames until recovery
+// SokuLib names this field `untech` and the offset reads it, but do NOT treat
+// it as "frames until I can act again". Measured over 337 000 corpus frames it
+// HOLDS its value on 90.6% of the ticks where it is non-zero, decrements on
+// 9.1%, reaches 26 507, and is non-zero on 64.2% of frames where the player is
+// not knocked down, not blocking and not in hitstop. It is logged because it
+// is cheap and may yet mean something; it is not a hitstun test, and
+// scripts/build_gyms.py deliberately selects on hitstop/knockdown/the guard
+// flags instead. A 64% base rate is also why a verification check that only
+// asked whether it fires after a hit was close to vacuous.
+constexpr int CHAR_UNTECH_OFFSET      = 0x4BA; // uint16, semantics unconfirmed
 
 // ---- projectiles ---------------------------------------------------------
 // `hitboxes` above does NOT cover these. It is the character's own attack-box
