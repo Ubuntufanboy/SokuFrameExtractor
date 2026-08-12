@@ -456,23 +456,62 @@ def check_proj_speed(rows, slots):
 
 
 def check_proj_bounds(rows, slots):
-    """Live bullets must be on the stage.
+    """Live projectile coordinates must be numbers the game could have meant.
 
-    Weak on its own -- it is the check a garbage pointer fails, not the one a
-    subtly wrong offset fails -- but it is the one that would catch the walk
-    reading a struct that is not an ObjectManager at all.
+    THIS ASKED THE WRONG QUESTION FIRST
+    -----------------------------------
+    The original version required 98% of projectiles to sit within 400 units of
+    the stage and failed replays at 4.3% and 6.5%. Being off-stage is not a
+    fault: a bullet that left the screen and has not despawned is ordinary, and
+    how much of it a match contains is a fact about the character, not about
+    the read. Measured over 1.23M records, 98.9% are on-stage, 1.07% just off,
+    0.035% far -- and the proportions swing by character.
+
+    What the walk can actually get wrong is following a pointer into something
+    that is not an ObjectManager -- and that does not produce a bullet 500
+    units past the wall either. It produces bytes reinterpreted as floats,
+    which scatter across every exponent there is.
+
+    SO THE TEST IS STRUCTURE, NOT MAGNITUDE
+    ---------------------------------------
+    Extreme coordinates are real and they are rare (0.076% of live objects
+    over ten replays). Every single one measured is order 1e9, clustered on
+    values just above 2^32 -- 4294967808, 4294968320, 4294968832 -- spaced 512
+    apart, which is exactly the float32 quantisation step at that magnitude.
+    They belong to ONE action id. That is a game value faithfully read, not a
+    misaligned one: reinterpreted bytes have no reason to land on a single
+    exponent, arrive in float32's own increments, or sort themselves by object
+    type.
+
+    So this passes rare extremes that are structurally concentrated and fails
+    ones that are not, which is the difference the check exists to detect.
+    `sokubot/data/state.py` clamps them on the training side; this reports how
+    much work that clamp is doing.
     """
-    out = tot = 0
+    LIMIT = 20 * 1200.0
+    bad = far = tot = 0
+    kinds: dict[int, int] = {}
+    mags: set[int] = set()
     for r in rows:
         for p in (1, 2):
             for q in _live(r, p, slots):
                 tot += 1
-                out += int(not (-400 <= q["x"] <= 1700
-                                and -400 <= q["y"] <= 1700))
+                m = max(abs(q["x"]), abs(q["y"]))
+                if m >= LIMIT:
+                    bad += 1
+                    kinds[q["act"]] = kinds.get(q["act"], 0) + 1
+                    mags.add(len(f"{int(m)}"))
+                elif not (-400 <= q["x"] <= 1700 and -400 <= q["y"] <= 1700):
+                    far += 1
     if tot < 100:
-        return Check("proj_bounds", None, f"only {tot} live bullets")
-    return Check("proj_bounds", out / tot < 0.02,
-                 f"{out} of {tot} live bullets are off-stage ({out/tot:.2%})")
+        return Check("proj_bounds", None, f"only {tot} live projectiles")
+    rate = bad / tot
+    # Rare and concentrated is a sentinel; common or scattered is a bad read.
+    ok = rate < 0.001 or (rate < 0.05 and len(kinds) <= 3 and len(mags) <= 2)
+    return Check("proj_bounds", ok,
+                 f"{bad} of {tot} live projectiles are extreme ({rate:.3%}) "
+                 f"across {len(kinds)} action id(s) and {len(mags)} magnitude(s)"
+                 f"; {far/tot:.2%} merely off-stage")
 
 
 def check_proj_hits(rows, slots):
