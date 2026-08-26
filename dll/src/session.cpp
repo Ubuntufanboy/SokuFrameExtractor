@@ -1089,7 +1089,7 @@ enum PolicyMode {
     PM_BULLET, PM_JUMP, PM_CROUCH, PM_DASH, PM_COUNT
 };
 
-static const int PM_WEIGHT[PM_COUNT] = { 6, 24, 30, 18, 16, 5, 3, 4 };
+static const int PM_WEIGHT[PM_COUNT] = { 4, 24, 25, 23, 12, 5, 3, 4 };
 static const int PM_MIN[PM_COUNT]    = {  6,  8, 14,  4,  4,  8,  6,  5 };
 static const int PM_MAX[PM_COUNT]    = { 24, 30, 50, 14, 12, 22, 18, 14 };
 
@@ -1137,6 +1137,20 @@ static void policyPick(int i) {
         case PM_BULLET: s_pol[i].extra = (rnd32() & 1) ? INPUT_B : INPUT_C; break;
         case PM_DASH:   s_pol[i].extra = (rnd32() & 1) ? 1 : 0; break;  // toward/away
         case PM_JUMP:   s_pol[i].extra = static_cast<unsigned short>(rnd32() % 3); break;
+        // Attack HEIGHT, which the first collector had no notion of. Human play
+        // shows wrongblock on 0.81% of frames and the first self-play corpus on
+        // 0.01% -- a hundredfold gap -- because every attack it threw was a mid
+        // and every block was a standing block, so the high/low guess that most
+        // of this game's defence consists of never came up once.
+        case PM_MELEE:  s_pol[i].extra = static_cast<unsigned short>(rnd32() % 4); break;
+        // Crouch-blocking, for the same reason from the defending side.
+        // Half, to match the half of melee variants that are lows. A defender
+        // guessing height uniformly against a uniform mix blocks correctly as
+        // often as it can without reading the attacker -- which it must not do,
+        // since reacting would put the opponent's animation into the decision
+        // and make the stance predictable from state again.
+        case PM_RETREAT: s_pol[i].extra = (rnd32() & 1); break;
+        case PM_CROUCH: s_pol[i].extra = static_cast<unsigned short>(rnd32() % 3); break;
         default:        s_pol[i].extra = 0; break;
     }
 }
@@ -1153,11 +1167,11 @@ static void policyPick(int i) {
 // conditioning on something UNRECORDED -- a hidden intent -- which is exactly
 // the confounder that caps the human corpus. The mode schedule stays exogenous;
 // only the action a mode resolves to reads the world.
-constexpr float MELEE_RANGE = 150.0f;   // past this, a melee button just whiffs
-constexpr float DASH_RANGE  = 250.0f;   // past this, walking in is too slow
+constexpr float MELEE_RANGE = 220.0f;   // roughly what a melee actually reaches
+constexpr float DASH_RANGE  = 150.0f;   // past this, walking in is too slow
 
 // `toward` is +1 when the opponent is to the right of this player.
-static unsigned short policyWord(int i, int toward, float dist) {
+static unsigned short policyWord(int i, int toward, float dist, int elapsed) {
     if (s_force_mode[i] >= 0) {
         s_pol[i].mode = s_force_mode[i];
         if (--s_pol[i].left <= 0) {
@@ -1180,18 +1194,41 @@ static unsigned short policyWord(int i, int toward, float dist) {
         // fell from 0.79% to 0.42% -- because most interaction at range is
         // bullets, and a player not holding back simply gets hit by them
         // instead of blocking them.
-        case PM_RETREAT:  return back;
+        case PM_RETREAT:  return s_pol[i].extra
+                                 ? static_cast<unsigned short>(back | INPUT_DOWN)
+                                 : back;
         // Walk in first. Pressing A at 400px is a whiffed animation, and a
         // whiff neither hits nor gets blocked, so it teaches the dynamics
         // nothing about either.
-        case PM_MELEE:    return (dist > MELEE_RANGE)
-                                 ? fwd
-                                 : static_cast<unsigned short>(fwd | INPUT_A);
+        // Walk in only when genuinely out of reach. The first collector gated
+        // this at 150px against a median separation of 304px, so melee almost
+        // never fired at all: 0.0168 of frames had an active hitbox against
+        // human play's 0.0591. Whiffs are not the waste that gate assumed --
+        // an active hitbox is a real event the dynamics have to represent.
+        case PM_MELEE:
+            if (dist > MELEE_RANGE) return fwd;
+            switch (s_pol[i].extra) {
+                case 1:  return static_cast<unsigned short>(INPUT_DOWN | INPUT_A);  // 2A, a low
+                case 2:  return static_cast<unsigned short>(fwd | INPUT_B);
+                case 3:  return static_cast<unsigned short>(INPUT_DOWN | INPUT_B);  // 2B, a low
+                default: return static_cast<unsigned short>(fwd | INPUT_A);
+            }
         case PM_BULLET:   return s_pol[i].extra;
-        case PM_JUMP:     return static_cast<unsigned short>(
-                              INPUT_UP | (s_pol[i].extra == 1 ? fwd
-                                        : s_pol[i].extra == 2 ? back : 0));
-        case PM_CROUCH:   return INPUT_DOWN;
+        // Rise, then swing. An air attack is this game's overhead, and a
+        // standing block does not stop one -- which is half of what makes
+        // blocking a decision rather than a reflex.
+        case PM_JUMP:
+            if (elapsed < 6)
+                return static_cast<unsigned short>(
+                    INPUT_UP | (s_pol[i].extra == 1 ? fwd
+                              : s_pol[i].extra == 2 ? back : 0));
+            return static_cast<unsigned short>(
+                (s_pol[i].extra == 1 ? fwd : 0) | INPUT_A);
+        case PM_CROUCH:   return s_pol[i].extra == 0
+                                 ? INPUT_DOWN
+                                 : static_cast<unsigned short>(
+                                       INPUT_DOWN | (s_pol[i].extra == 1 ? INPUT_A
+                                                                         : INPUT_B));
         case PM_DASH:     return static_cast<unsigned short>(
                               (s_pol[i].extra ? fwd : back) | INPUT_D);
         case PM_NEUTRAL:
@@ -1211,8 +1248,10 @@ static void policyDrive(void* bm) {
     const float x1 = sfe::readPlayerState(p1obj).x;
     const float x2 = sfe::readPlayerState(p2obj).x;
     const float d  = x1 > x2 ? x1 - x2 : x2 - x1;
-    s_kmm_word[0]  = policyWord(0, x2 >= x1 ?  1 : -1, d);
-    s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d);
+    s_kmm_word[0]  = policyWord(0, x2 >= x1 ?  1 : -1, d,
+                                PM_MAX[s_pol[0].mode] - s_pol[0].left);
+    s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d,
+                                PM_MAX[s_pol[1].mode] - s_pol[1].left);
     s_kmm_drive[0] = s_kmm_drive[1] = true;
 }
 
