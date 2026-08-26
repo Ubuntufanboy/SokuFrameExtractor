@@ -19,6 +19,11 @@
 
 namespace sfe {
 
+static void scanForNeedle();
+static void applyBranch();
+static void forceBranchInput(void*, void*, long);
+static long branchScanFrame();
+
 // -------------------------------------------------------------------------
 // Scene id, read straight from game memory.
 // -------------------------------------------------------------------------
@@ -292,13 +297,570 @@ static volatile LONG s_start_request = 0;  // 1: do the start on the next tick
 static volatile LONG s_start_done    = 0;  // 1: ok, -1: the game rejected the .rep
 static volatile LONG s_start_mode    = -1; // mainMode the game picked, for the log
 
+// -------------------------------------------------------------------------
+// Finding the decoded replay input buffer
+// -------------------------------------------------------------------------
+// The counterfactual measurement this project needs -- roll the SAME state
+// forward under two different actions -- cannot come from the corpus, because
+// the corpus never contains one state played two ways. It can come from the
+// game: play a replay twice and overwrite one player's input for a window of
+// frames in the second run. Everything before the window is bit-identical
+// because replay playback is deterministic, so the difference after it is a
+// true interventional effect with the opponent's inputs held fixed.
+//
+// Editing the .rep file is the hard way round: its input section is deflate
+// compressed and `pipeline/repparse.py` fails to decode two thirds of the
+// corpus. readReplay() has already done that work in memory, so the buffer it
+// produced is what to patch -- once its address is known, which is what this
+// searches for.
+//
+// The needle comes from outside: `inputs.csv` for a replay already captured
+// gives the exact per-frame words, and SokuLib documents the bit layout
+// (BattleKeys: up/down/left/right/A/B/C/dash then A+B, B+C). So the search is
+// for a byte string that must be present rather than for a plausible-looking
+// pointer, which is the difference between finding the buffer and believing
+// one has been found.
+constexpr size_t MAX_NEEDLE = 1024;
+
+static int hexNybble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Where the needle was found, so the branch patch can be placed relative to it.
+static unsigned char* s_replay_inputs = nullptr;
+
+// -------------------------------------------------------------------------
+// The branch
+// -------------------------------------------------------------------------
+// Overwrite one player's input for a window of frames. Run the same replay
+// twice -- once clean, once branched -- and everything before the window is
+// bit-identical, because replay playback is deterministic. The difference
+// after it is a true interventional effect with the opponent's inputs held
+// fixed, which is exactly the counterfactual the corpus cannot contain and
+// exactly the pairing `scripts/action_influence.py` computes inside the model.
+//
+// The layout is confirmed by the search rather than assumed: the needle is 48
+// frames of INTERLEAVED p1/p2 16-bit words, 192 contiguous bytes, and it
+// matched exactly once in the whole address space.
+static void applyBranch() {
+    if (!s_replay_inputs) return;
+    const char* fr = getenv("SFE_BRANCH_FRAME");
+    if (!fr || !*fr) return;
+    const long frame  = strtol(fr, nullptr, 10);
+    const char* le    = getenv("SFE_BRANCH_LEN");
+    const char* wd    = getenv("SFE_BRANCH_WORD");
+    const char* pl    = getenv("SFE_BRANCH_PLAYER");
+    const long len    = le ? strtol(le, nullptr, 10) : 32;
+    const long word   = wd ? strtol(wd, nullptr, 0)  : 0;
+    const long player = pl ? strtol(pl, nullptr, 10) : 1;
+    if (frame < 0 || len <= 0 || player < 1 || player > 2) {
+        sfe::log("applyBranch: bad parameters, skipping");
+        return;
+    }
+    // Frame 0 of the buffer, from the frame the needle was taken at.
+    const char* nf = getenv("SFE_NEEDLE_FRAME");
+    const long nfr = nf ? strtol(nf, nullptr, 10) : 0;
+    auto* base = s_replay_inputs - 4 * nfr;
+    auto* slot = reinterpret_cast<unsigned short*>(base + 4 * frame)
+               + (player - 1);
+    DWORD old_prot = 0;
+    if (!VirtualProtect(slot, sizeof(unsigned short) * 2 * len,
+                        PAGE_READWRITE, &old_prot)) {
+        sfe::log("applyBranch: VirtualProtect failed (GLE=%lu)", GetLastError());
+        return;
+    }
+    unsigned short before = slot[0];
+    for (long i = 0; i < len; ++i)
+        slot[i * 2] = static_cast<unsigned short>(word);
+    VirtualProtect(slot, sizeof(unsigned short) * 2 * len, old_prot, &old_prot);
+    sfe::log("applyBranch: player %ld frames %ld..%ld set to 0x%04lX "
+             "(was 0x%04X) at %p", player, frame, frame + len - 1,
+             word, before, slot);
+}
+
+// Overwrite the character's own input word, and the KeymapManager copy the
+// replay fills, for a window of battle frames.
+//
+//   char_obj + 0x754   the word `readPlayerInput` already reads -- what the
+//                      character logic consumes this tick
+//   char_obj + 0x750   -> KeyManager -> KeymapManager, whose `inKeys` SokuLib
+//                      documents as the field replays and netplay "copy
+//                      to/from"; +0x60 past the vtable, 13-int KeyBindings and
+//                      10-int KeyInput
+//
+// Both, because which one the engine reads back is exactly what is unknown.
+
+// `char_obj + 0x754` is NOT a 16-bit word. `readPlayerInput` reads it as
+// SWRCHARINPUT -- eight ints {lr, ud, a, b, c, d, ch, s}, axes SIGNED. Writing
+// a uint16 there sets only the low half of `lr`: with lr at 0xFFFFFFF8 (-8,
+// left) a write of 0x0004 leaves 0xFFFF0004, still negative, still left. The
+// write lands and means nothing, which is exactly what the first attempt
+// measured -- identical inputs, identical state, no divergence.
+struct SWRCHARINPUT { int lr, ud, a, b, c, d, ch, s; };
+
+// -------------------------------------------------------------------------
+// Injecting through the engine's own input source
+// -------------------------------------------------------------------------
+// Offsets confirmed by measurement, not read off the header. The mirror scan
+// found p2's live input word at inputMgr+0xD0, and the character's own pointer
+// chain (char+0x750 -> KeyManager -> KeymapManager) puts p2's KeymapManager at
+// inputMgr+0x70. So inKeys sits at KeymapManager+0x60 -- which settles the
+// contradiction inside SokuLib's header, where KeyInput is declared with ten
+// ints but annotated `int[8] (32)` two lines above. Ten is right:
+// 4 (vtable) + 0x34 (KeyBindings) + 0x28 (KeyInput) = 0x60 exactly. outKeys
+// follows at +0x62, readInKeys at +0x64.
+//
+// Reached through the character rather than from a hardcoded address, so it
+// stays correct if the managers ever move: the two the run measured were
+// inputMgr+0x08 and inputMgr+0x70, 0x68 apart, but nothing here depends on
+// that.
+constexpr int CHAR_KEYMANAGER_OFFSET = 0x750;
+constexpr int KMM_INKEYS_OFFSET      = 0x60;
+constexpr int KMM_READIN_OFFSET      = 0x64;
+
+static void* keymapManagerOf(void* char_obj) {
+    if (!char_obj) return nullptr;
+    auto* km = *reinterpret_cast<void**>(
+                   reinterpret_cast<char*>(char_obj) + CHAR_KEYMANAGER_OFFSET);
+    if (!km) return nullptr;
+    return *reinterpret_cast<void**>(km);
+}
+
+// readInKeys is set alongside the word because that is the flag SokuLib names
+// for "this manager's input arrives from elsewhere" -- the netplay path. Under
+// it the engine's refill is the thing doing the writing to keyMap, which is
+// why this works where writing keyMap directly could not: the refill happens
+// after the hook either way, so the only way to win is to own its input.
+// The two KeymapManagers, as static addresses. In replay submode the
+// character's own chain resolves to exactly these (p1 -> inputMgr+0x08, p2 ->
+// inputMgr+0x70), but in a PLAYING submode char+0x750 comes back null, so the
+// chain cannot be the only way in. Measured both ways rather than assumed.
+constexpr DWORD ADDR_KEYMAP_MGR_P1 = ADDR_INPUT_MANAGER + 0x08;
+constexpr DWORD ADDR_KEYMAP_MGR_P2 = ADDR_INPUT_MANAGER + 0x70;
+constexpr int   KMM_INPUT_OFFSET   = 0x38;   // KeyInput, ten ints
+
+static void* keymapManagerFor(void* char_obj, int player) {
+    if (void* kmm = keymapManagerOf(char_obj)) return kmm;
+    return reinterpret_cast<void*>(player == 2 ? ADDR_KEYMAP_MGR_P2
+                                               : ADDR_KEYMAP_MGR_P1);
+}
+
+// Three surfaces, because which one a PLAYING submode reads is exactly what is
+// unknown, and writing all three costs nothing next to another run:
+//
+//   +0x38  KeyInput   the decoded ten-int form, what a device poll produces
+//   +0x60  inKeys     the packed word netplay and replays copy through
+//   +0x64  readInKeys the flag that says inKeys is the source
+//
+// SFE_DRIVE narrows it afterwards: "input", "inkeys", or unset for all.
+static void forceViaKeymap(void* char_obj, int player, unsigned short word) {
+    void* kmm = keymapManagerFor(char_obj, player);
+    if (!kmm) return;
+    auto* p = reinterpret_cast<char*>(kmm);
+    const char* which = getenv("SFE_DRIVE");
+    if (!which || strcmp(which, "input") == 0) {
+        auto* in = reinterpret_cast<volatile int*>(p + KMM_INPUT_OFFSET);
+        in[0] = (word & INPUT_LEFT) ? -1 : (word & INPUT_RIGHT) ? 1 : 0;
+        in[1] = (word & INPUT_UP)   ? -1 : (word & INPUT_DOWN)  ? 1 : 0;
+        in[2] = (word & INPUT_A)      ? 1 : 0;
+        in[3] = (word & INPUT_B)      ? 1 : 0;
+        in[4] = (word & INPUT_C)      ? 1 : 0;
+        in[5] = (word & INPUT_D)      ? 1 : 0;
+        in[6] = (word & INPUT_CHANGE) ? 1 : 0;
+        in[7] = (word & INPUT_SPELL)  ? 1 : 0;
+    }
+    if (!which || strcmp(which, "inkeys") == 0) {
+        *reinterpret_cast<volatile unsigned short*>(p + KMM_INKEYS_OFFSET) = word;
+        *reinterpret_cast<volatile unsigned char*>(p + KMM_READIN_OFFSET)  = 1;
+    }
+}
+
+// One-shot picture of both managers, so a null result can be told apart from a
+// write that landed somewhere inert.
+static void dumpKeymapManagers(void* p1obj, void* p2obj) {
+    void* o[2] = { p1obj, p2obj };
+    for (int i = 0; i < 2; ++i) {
+        void* kmm = keymapManagerFor(o[i], i + 1);
+        auto* p = reinterpret_cast<char*>(kmm);
+        auto* in = reinterpret_cast<volatile int*>(p + KMM_INPUT_OFFSET);
+        sfe::log("  p%d kmm=%p (chain=%p) input=[%d %d %d %d %d %d] "
+                 "inKeys=0x%04X outKeys=0x%04X readInKeys=%d",
+                 i + 1, kmm, keymapManagerOf(o[i]),
+                 in[0], in[1], in[2], in[3], in[4], in[5],
+                 *reinterpret_cast<volatile unsigned short*>(p + KMM_INKEYS_OFFSET),
+                 *reinterpret_cast<volatile unsigned short*>(p + KMM_INKEYS_OFFSET + 2),
+                 *reinterpret_cast<volatile unsigned char*>(p + KMM_READIN_OFFSET));
+    }
+}
+
+static void forceOne(void* char_obj, unsigned short word) {
+    if (!char_obj) return;
+    auto* inp = reinterpret_cast<volatile SWRCHARINPUT*>(
+        reinterpret_cast<char*>(char_obj) + CHAR_INPUT_OFFSET);
+    inp->lr = (word & INPUT_LEFT) ? -1 : (word & INPUT_RIGHT) ? 1 : 0;
+    inp->ud = (word & INPUT_UP)   ? -1 : (word & INPUT_DOWN)  ? 1 : 0;
+    inp->a  = (word & INPUT_A)      ? 1 : 0;
+    inp->b  = (word & INPUT_B)      ? 1 : 0;
+    inp->c  = (word & INPUT_C)      ? 1 : 0;
+    inp->d  = (word & INPUT_D)      ? 1 : 0;
+    inp->ch = (word & INPUT_CHANGE) ? 1 : 0;
+    inp->s  = (word & INPUT_SPELL)  ? 1 : 0;
+}
+
+static void forceBranchInput(void* p1obj, void* p2obj, long battle_frame) {
+    const char* fr = getenv("SFE_BRANCH_FRAME");
+    if (!fr || !*fr) return;
+    const long start = strtol(fr, nullptr, 10);
+    const char* le = getenv("SFE_BRANCH_LEN");
+    const char* wd = getenv("SFE_BRANCH_WORD");
+    const char* pl = getenv("SFE_BRANCH_PLAYER");
+    const long len    = le ? strtol(le, nullptr, 10) : 32;
+    const long word   = wd ? strtol(wd, nullptr, 0)  : 0;
+    const long player = pl ? strtol(pl, nullptr, 10) : 1;
+    void* obj = (player == 2) ? p2obj : p1obj;
+    if (!obj) return;
+    auto* slot = reinterpret_cast<volatile SWRCHARINPUT*>(
+        reinterpret_cast<char*>(obj) + CHAR_INPUT_OFFSET);
+    if (battle_frame == start + len) {
+        sfe::log("forceBranch: readback after window lr=%d ud=%d a=%d",
+                 slot->lr, slot->ud, slot->a);
+        return;
+    }
+    if (battle_frame < start || battle_frame >= start + len) return;
+    if (battle_frame == start)
+        sfe::log("forceBranch: window %ld..%ld player %ld word 0x%04lX "
+                 "(was lr=%d ud=%d)", start, start + len - 1, player, word,
+                 slot->lr, slot->ud);
+    forceOne(obj, static_cast<unsigned short>(word));
+}
+
+// Which battle frame to scan on. Must be well before the branch frame, and
+// after the battle has actually begun.
+static long branchScanFrame() {
+    const char* v = getenv("SFE_SCAN_FRAME");
+    return v && *v ? strtol(v, nullptr, 10) : -1;
+}
+
+static void scanForNeedle() {
+    const char* hex = getenv("SFE_FIND_HEX");
+    if (!hex || !*hex) return;
+
+    // A fixed buffer, not std::vector: `dll/include/sfe/config.hpp` records
+    // that any use of the C++ standard library here drags in msvcp140, whose
+    // Wine builtin aborts the process at module load. The build guard catches
+    // it, which is how this comment came to exist.
+    unsigned char needle[MAX_NEEDLE];
+    size_t nlen = 0;
+    for (const char* q = hex; q[0] && q[1] && nlen < MAX_NEEDLE; q += 2) {
+        int hi = hexNybble(q[0]), lo = hexNybble(q[1]);
+        if (hi < 0 || lo < 0) break;
+        needle[nlen++] = static_cast<unsigned char>((hi << 4) | lo);
+    }
+    if (nlen < 8) {
+        sfe::log("scanForNeedle: needle too short (%u bytes)",
+                 static_cast<unsigned>(nlen));
+        return;
+    }
+    sfe::log("scanForNeedle: searching for %u bytes",
+             static_cast<unsigned>(nlen));
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    auto* addr = reinterpret_cast<unsigned char*>(si.lpMinimumApplicationAddress);
+    auto* end  = reinterpret_cast<unsigned char*>(si.lpMaximumApplicationAddress);
+    int hits = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (addr < end && VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                             | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & readable)
+            && !(mbi.Protect & PAGE_GUARD)) {
+            auto* base = static_cast<unsigned char*>(mbi.BaseAddress);
+            const size_t n = mbi.RegionSize;
+            if (n >= nlen) {
+                for (size_t i = 0; i + nlen <= n; ++i) {
+                    if (base[i] == needle[0]
+                        && memcmp(base + i, needle, nlen) == 0) {
+                        sfe::log("scanForNeedle: HIT at %p "
+                                 "(region %p size %zu protect 0x%lx)",
+                                 base + i, mbi.BaseAddress, n, mbi.Protect);
+                        // Only a UNIQUE hit identifies the buffer. Two hits
+                        // mean the needle is ambiguous and patching either one
+                        // would be a guess, so the branch is refused below.
+                        if (hits == 0) s_replay_inputs = base + i;
+                        if (++hits >= 16) {
+                            sfe::log("scanForNeedle: stopping at 16 hits");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        auto* next = static_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+    }
+    sfe::log("scanForNeedle: done, %d hit(s)", hits);
+    if (hits != 1) {
+        s_replay_inputs = nullptr;
+        sfe::log("scanForNeedle: not unique, refusing to branch");
+    }
+}
+
+// -------------------------------------------------------------------------
+// Mirror scan -- where does this tick's input word actually live?
+// -------------------------------------------------------------------------
+// Writing char+0x754 does land, but by the time the swap hook can reach it the
+// character has already consumed it -- measured: forced input appears in the
+// captured p1_input column while p1_x stays bit-identical to the clean run.
+// Injection therefore needs a source the engine reads LATER in its own tick.
+// SokuLib names one: KeymapManager::inKeys, the field it documents as what
+// replays and netplay "copy to/from".
+//
+// Its offset cannot be read off the header with confidence. KeyInput is
+// declared with ten ints but annotated `int[8] (32) 0x38` two lines above, so
+// inKeys sits at either +0x58 or +0x60, and there is more than one
+// KeymapManager besides. Guessing between them is how the 0x754 attempt burned
+// a day: the write landed at a plausible address and meant nothing.
+//
+// So measure it. This is scanForNeedle's method made temporal: every battle
+// frame, keep only the addresses whose uint16 still equals that player's packed
+// input word. A wrong address survives one frame by luck and one frame in
+// 65536 by coincidence; after a hundred frames of varying input, what survives
+// is a mirror of the input word and nothing else. Writable regions only --
+// inKeys is written every tick, so anything in .text or .rdata is noise.
+constexpr int MIRROR_MAX = 65536;
+
+static DWORD s_mirror[2][MIRROR_MAX];
+static int   s_mirror_n[2]    = { -1, -1 };   // -1 = not seeded yet
+static int   s_mirror_seen[2] = { 0, 0 };
+static int   s_mirror_diff    = 0;   // frames where the two words differed
+static long  s_mirror_wait    = 0;   // frames spent waiting for a good seed
+static bool  s_mirror_done    = false;
+
+static int popcount16(unsigned short v) {
+    int n = 0;
+    while (v) { v &= static_cast<unsigned short>(v - 1); ++n; }
+    return n;
+}
+
+// A candidate's region can be freed between frames, so every follow-up read is
+// guarded. SEH rather than a VirtualQuery per address: same safety, and it
+// does not cost a syscall per candidate per frame.
+static bool mirrorRead(DWORD a, unsigned short* out) {
+    __try {
+        *out = *reinterpret_cast<volatile unsigned short*>(a);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Returns the true match count, which may exceed MIRROR_MAX; the caller needs
+// to know it was truncated, because a truncated seed can drop the real answer.
+static int mirrorSeed(int who, unsigned short word) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    auto* addr = reinterpret_cast<unsigned char*>(si.lpMinimumApplicationAddress);
+    auto* end  = reinterpret_cast<unsigned char*>(si.lpMaximumApplicationAddress);
+    int n = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (addr < end && VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        const DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY
+                             | PAGE_EXECUTE_READWRITE;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & writable)
+            && !(mbi.Protect & PAGE_GUARD)) {
+            auto* base = static_cast<unsigned char*>(mbi.BaseAddress);
+            for (size_t i = 0; i + 2 <= mbi.RegionSize; i += 2) {
+                if (*reinterpret_cast<unsigned short*>(base + i) == word) {
+                    if (n < MIRROR_MAX)
+                        s_mirror[who][n] = reinterpret_cast<DWORD>(base + i);
+                    ++n;
+                }
+            }
+        }
+        auto* next = static_cast<unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= addr) break;
+        addr = next;
+    }
+    return n;
+}
+
+static void mirrorFilter(int who, unsigned short word) {
+    int w = 0;
+    for (int i = 0; i < s_mirror_n[who]; ++i) {
+        unsigned short v = 0;
+        if (mirrorRead(s_mirror[who][i], &v) && v == word)
+            s_mirror[who][w++] = s_mirror[who][i];
+    }
+    s_mirror_n[who] = w;
+}
+
+// Relate a surviving address back to a structure the game names, so the answer
+// is reusable next run rather than a bare address that means nothing once the
+// heap moves.
+static void mirrorAnnotate(DWORD a, void* obj, char* out, size_t cap) {
+    struct { DWORD base; const char* name; } known[] = {
+        { ADDR_INPUT_CLUSTER, "inputMgrCluster" },
+        { ADDR_INPUT_MANAGER, "inputMgr"        },
+        { ADDR_BATTLE_MANAGER, "&battleMgrPtr"  },
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (a >= known[i].base && a < known[i].base + 0x1000) {
+            snprintf(out, cap, "  [%s+0x%lX]", known[i].name, a - known[i].base);
+            return;
+        }
+    }
+    const DWORD o = reinterpret_cast<DWORD>(obj);
+    if (obj && a >= o && a < o + 0x1000) {
+        snprintf(out, cap, "  [char+0x%lX]", a - o);
+        return;
+    }
+    // The KeymapManager a character reads through is reachable by pointer:
+    // char+0x750 -> KeyManager -> KeymapManager. Report the offset into
+    // whichever of those two it turns out to land in.
+    if (obj) {
+        __try {
+            auto* km = *reinterpret_cast<void**>(
+                           reinterpret_cast<char*>(obj) + 0x750);
+            if (km) {
+                const DWORD k = reinterpret_cast<DWORD>(km);
+                if (a >= k && a < k + 0x1000) {
+                    snprintf(out, cap, "  [char->keyManager+0x%lX]", a - k);
+                    return;
+                }
+                auto* kmm = *reinterpret_cast<void**>(km);
+                const DWORD m = reinterpret_cast<DWORD>(kmm);
+                if (kmm && a >= m && a < m + 0x1000) {
+                    snprintf(out, cap, "  [char->keymapManager+0x%lX]", a - m);
+                    return;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    out[0] = '\0';
+}
+
+static void mirrorReport(int who, void* obj) {
+    sfe::log("mirrorScan: p%d -- %d survivor(s) after %d frames",
+             who + 1, s_mirror_n[who], s_mirror_seen[who]);
+    for (int i = 0; i < s_mirror_n[who] && i < 40; ++i) {
+        char note[128];
+        mirrorAnnotate(s_mirror[who][i], obj, note, sizeof(note));
+        sfe::log("  p%d mirror 0x%08lX%s", who + 1, s_mirror[who][i], note);
+    }
+}
+
+static void mirrorScan(unsigned short p1, unsigned short p2,
+                       void* p1obj, void* p2obj) {
+    if (s_mirror_done || !getenv("SFE_MIRROR_SCAN")) return;
+    const char* fv   = getenv("SFE_MIRROR_FRAMES");
+    const int   want = fv && *fv ? static_cast<int>(strtol(fv, nullptr, 10)) : 120;
+    const char* bv   = getenv("SFE_MIRROR_MIN_BITS");
+    const int   minb = bv && *bv ? static_cast<int>(strtol(bv, nullptr, 10)) : 4;
+
+    const unsigned short w[2] = { p1, p2 };
+
+    if (s_mirror_n[0] < 0 || s_mirror_n[1] < 0) {
+        // Seed both players on ONE frame, and only on a frame that can tell
+        // them apart. The first run seeded each player independently on its
+        // own first nonzero word and came back with two survivors for p2 and
+        // none for p1 -- uninterpretable, for two separate reasons this guard
+        // fixes.
+        //
+        // Identical words make each player's candidate set a superset of the
+        // other's, so a survivor cannot be attributed to a player.
+        //
+        // And a low-popcount word is a terrible seed: 0x0004 (left, alone) is
+        // one of the commonest 16-bit values in a 32-bit process's memory and
+        // matched 94422 addresses, past the cap -- which silently discards
+        // candidates, and the discarded set is where the answer was.
+        // Seed each player on the first frame its OWN word is distinctive
+        // enough, rather than on a frame that suits both. Seeding jointly on a
+        // 2-bit word cost the p1 list outright: 0x0006 matched 120714
+        // addresses, past the cap, so p1's four "survivors" came from a
+        // truncated seed and cannot be trusted, while p2 seeded on 0x0089
+        // (3422 candidates) and is sound. Popcount is the lever -- a word with
+        // more bits set is a rarer bit pattern in a 32-bit process's memory.
+        //
+        // Relaxing is what keeps this from stalling: a player who never
+        // presses three keys at once would otherwise never seed at all, which
+        // is the failure the first 3-bit run produced (no output whatsoever).
+        ++s_mirror_wait;
+        const char* rv = getenv("SFE_MIRROR_RELAX");
+        const long relax = rv && *rv ? strtol(rv, nullptr, 10) : 900;
+        int need = minb - static_cast<int>(s_mirror_wait / relax);
+        if (need < 1) need = 1;
+        for (int k = 0; k < 2; ++k) {
+            if (s_mirror_n[k] >= 0) continue;
+            if (popcount16(w[k]) < need) continue;
+            if (w[k] == w[1 - k]) continue;   // cannot attribute a shared word
+            const int n = mirrorSeed(k, w[k]);
+            s_mirror_n[k] = n < MIRROR_MAX ? n : MIRROR_MAX;
+            s_mirror_seen[k] = 1;
+            sfe::log("mirrorScan: p%d seeded on 0x%04X (%d bits) -- %d candidate(s)%s",
+                     k + 1, w[k], popcount16(w[k]), n,
+                     n > MIRROR_MAX ? "  *** TRUNCATED, answer may be lost ***"
+                                    : "");
+        }
+        return;
+    }
+
+    for (int k = 0; k < 2; ++k) {
+        mirrorFilter(k, w[k]);
+        ++s_mirror_seen[k];
+    }
+    // How many frames could actually have told the two players apart. Without
+    // this the survivor count means nothing: if the two players pressed the
+    // same word all run, every one of p1's mirrors survives p2's filter too.
+    if (p1 != p2) ++s_mirror_diff;
+
+    if (s_mirror_seen[0] % 20 == 0)
+        sfe::log("mirrorScan: %d/%d candidate(s) after %d frames (%d discriminating)",
+                 s_mirror_n[0], s_mirror_n[1], s_mirror_seen[0], s_mirror_diff);
+
+    if (s_mirror_seen[0] < want) return;
+    sfe::log("mirrorScan: %d of %d frames had p1 != p2",
+             s_mirror_diff, s_mirror_seen[0]);
+    mirrorReport(0, p1obj);
+    mirrorReport(1, p2obj);
+    s_mirror_done = true;
+}
+
+// Dump the InputManager struct, so a hit can be related back to a field the
+// game itself uses rather than to a bare address that means nothing next run.
+static void dumpInputManager() {
+    if (!getenv("SFE_DUMP_IM")) return;
+    auto* im = reinterpret_cast<volatile unsigned char*>(ADDR_INPUT_MANAGER);
+    char line[160];
+    for (int off = 0; off < 0x180; off += 16) {
+        int k = snprintf(line, sizeof(line), "IM+%03X:", off);
+        for (int j = 0; j < 16; ++j)
+            k += snprintf(line + k, sizeof(line) - k, " %02X", im[off + j]);
+        sfe::log("%s", line);
+    }
+}
+
 // The hook.  Runs on the game's main thread from 0x00407F43.
 static int __fastcall HookedSceneProcess(void* This, void* edx) {
     if (InterlockedCompareExchange(&s_start_request, 0, 1) == 1) {
         auto readReplay = reinterpret_cast<PFN_readReplay>(ADDR_READ_REPLAY);
         void* mgr = reinterpret_cast<void*>(ADDR_INPUT_MANAGER);
 
-        if (!readReplay(mgr, s_replay_path)) {
+        // Skipping the replay entirely is the control for a specific
+        // suspicion: that a match started with SFE_BATTLE_SUBMODE=0 still has
+        // its inputs driven by the decoded replay stream. The evidence for it
+        // is that the mirror scan returns the same heap addresses in both
+        // submodes, and that the KeymapManagers read [0 0 0 0 0 0] while keyMap
+        // is nonzero -- something other than the managers is supplying input.
+        // If no replay is loaded and the managers become authoritative, that
+        // settles it and the self-play vehicle is a cold VS start.
+        const bool skip_replay = getenv("SFE_NO_REPLAY") != nullptr;
+        if (skip_replay) sfe::log("SFE_NO_REPLAY: starting a battle with no replay loaded");
+        if (!skip_replay && !readReplay(mgr, s_replay_path)) {
             // The game itself says this file is not loadable.  Report it as
             // such rather than letting it look like a navigation failure --
             // that distinction was impossible to make with keypresses.
@@ -306,15 +868,43 @@ static int __fastcall HookedSceneProcess(void* This, void* edx) {
             return s_orig_scene_process(This, edx);
         }
 
+        dumpInputManager();
+        scanForNeedle();
+        applyBranch();
+
         guardInputDeviceSelector();
 
         const unsigned char rep_mode =
             *reinterpret_cast<volatile unsigned char*>(ADDR_INPUT_MANAGER
                                                        + IM_REPLAY_MODE_OFFSET);
-        const int main_mode = (rep_mode == 0) ? 0 : (rep_mode == 7 ? 7 : 3);
+        const int main_mode = skip_replay ? 3
+                            : (rep_mode == 0) ? 0 : (rep_mode == 7 ? 7 : 3);
 
-        reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(
-            main_mode, BATTLE_SUBMODE_REPLAY);
+        // The .rep is being used for two different jobs here, and they can be
+        // separated. readReplay() has already decoded the match setup --
+        // characters, decks, stage, weather -- and setBattleMode() starts a
+        // battle with it. Only the SUBMODE decides where the per-frame inputs
+        // then come from.
+        //
+        // Under BATTLE_SUBMODE_REPLAY the decoded input stream is authoritative
+        // and nothing downstream can be overridden: writing keyMap at onProcess
+        // entry is overwritten by the refill, writing it at swap time is a tick
+        // late, and writing inKeys is ignored outright (all three measured, 0
+        // of 40 forced frames taking effect). Under a PLAYING submode the
+        // engine reads its KeymapManagers instead, which is the surface this
+        // module can own.
+        //
+        // So: same setup, different input source. The replay supplies the
+        // matchup and no menu is navigated; the players are ours.
+        const char* smv = getenv("SFE_BATTLE_SUBMODE");
+        const int sub = smv && *smv ? static_cast<int>(strtol(smv, nullptr, 10))
+                                    : BATTLE_SUBMODE_REPLAY;
+        const char* bmv = getenv("SFE_BATTLE_MODE");
+        const int bmode = bmv && *bmv ? static_cast<int>(strtol(bmv, nullptr, 10))
+                                      : main_mode;
+        sfe::log("setBattleMode(%d, %d)  [replay says mode %d]",
+                 bmode, sub, main_mode);
+        reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(bmode, sub);
 
         InterlockedExchange(&s_start_mode, main_mode);
         InterlockedExchange(&s_start_done, 1);
@@ -376,6 +966,604 @@ static void restoreSceneHook() {
     }
     s_scene_vtbl         = nullptr;
     s_orig_scene_process = nullptr;
+}
+
+
+// -------------------------------------------------------------------------
+// Owning the poll
+// -------------------------------------------------------------------------
+// The hardware watchpoint named the writer of keyMap, and disassembling around
+// it settled the whole question. The character's input update at 0x0046C8E0
+// does this:
+//
+//     46c8e6  mov 0x750(%esi),%eax   ; char->keyManager, and
+//     46c8ee  je  0x46cabb           ;   if null the copy never happens
+//     46c8f7  mov (%eax),%edi        ; edi = KeymapManager*
+//     46c900  call *%edx             ; edi->vtable[1]()  -- refills input
+//     46c92e  mov 0x38(%edi),%ebp    ; read KeymapManager+0x38 (KeyInput)
+//     46c931  mov %ebp,0x754(%esi)   ; write char+0x754, and 0x758.. after it
+//
+// So KeymapManager+0x38 really was the right surface -- every write to it just
+// happened to be undone by the poll at 0x46c900, a few instructions before the
+// copy. Writing keyMap directly loses for the mirror-image reason: the copy at
+// 0x46c92e comes after any hook that runs at onProcess entry.
+//
+// Between those two instructions there is exactly one seam, and it is the poll
+// itself. Hooking vtable[1] and writing KeyInput *after* calling the original
+// means the engine's own copy carries the value through -- whatever the
+// original poll read from, device or replay stream, is simply overwritten
+// before it is used. Nothing downstream has to be fought.
+static PFN_sceneProcess s_orig_kmm_poll = nullptr;
+static DWORD*           s_kmm_vtbl      = nullptr;
+static void*            s_kmm[2]        = { nullptr, nullptr };
+static unsigned short   s_kmm_word[2]   = { 0, 0 };
+static bool             s_kmm_drive[2]  = { false, false };
+static long             s_poll_calls    = 0;
+
+static void writeKeyInput(void* kmm, unsigned short word) {
+    auto* in = reinterpret_cast<volatile int*>(
+        reinterpret_cast<char*>(kmm) + KMM_INPUT_OFFSET);
+    in[0] = (word & INPUT_LEFT) ? -1 : (word & INPUT_RIGHT) ? 1 : 0;
+    in[1] = (word & INPUT_UP)   ? -1 : (word & INPUT_DOWN)  ? 1 : 0;
+    in[2] = (word & INPUT_A)      ? 1 : 0;
+    in[3] = (word & INPUT_B)      ? 1 : 0;
+    in[4] = (word & INPUT_C)      ? 1 : 0;
+    in[5] = (word & INPUT_D)      ? 1 : 0;
+    in[6] = (word & INPUT_CHANGE) ? 1 : 0;
+    in[7] = (word & INPUT_SPELL)  ? 1 : 0;
+}
+
+static int __fastcall HookedKeymapPoll(void* This, void* edx) {
+    const int r = s_orig_kmm_poll(This, edx);
+    ++s_poll_calls;
+    for (int i = 0; i < 2; ++i)
+        if (This == s_kmm[i] && s_kmm_drive[i])
+            writeKeyInput(This, s_kmm_word[i]);
+    return r;
+}
+
+// Both players' managers are separate objects of the same class, so they share
+// one vtable and one patch covers both; `This` tells them apart at call time.
+// The looping menu-free match (submode 0) and working injection are otherwise
+// mutually exclusive: under a PLAYING submode char+0x750 comes back null, and
+// 0x46c8ee then skips the entire copy, so no manager drives the character.
+//
+// The wiring is a single pointer, and replay submode shows what it should be --
+// p1 -> 0x008987F0, p2 -> 0x008987F8, the two static KeyManager objects that
+// point at the managers at inputMgr+0x08 and +0x70. Restoring it makes the
+// character take the same path it takes during a replay, which is the path the
+// poll hook already owns.
+constexpr DWORD ADDR_KEY_MGR_P1 = ADDR_INPUT_MANAGER + 0xD8;  // 0x008987F0
+constexpr DWORD ADDR_KEY_MGR_P2 = ADDR_INPUT_MANAGER + 0xE0;  // 0x008987F8
+
+static void wireKeyManagers(void* p1obj, void* p2obj) {
+    if (!getenv("SFE_WIRE_KEYMGR")) return;
+    void* o[2] = { p1obj, p2obj };
+    const DWORD want[2] = { ADDR_KEY_MGR_P1, ADDR_KEY_MGR_P2 };
+    for (int i = 0; i < 2; ++i) {
+        if (!o[i]) continue;
+        auto* slot = reinterpret_cast<DWORD*>(
+            reinterpret_cast<char*>(o[i]) + CHAR_KEYMANAGER_OFFSET);
+        if (*slot) continue;                 // already wired; leave it alone
+        *slot = want[i];
+        sfe::log("wireKeyManagers: p%d char+0x750 was null, set to 0x%08lX",
+                 i + 1, want[i]);
+    }
+}
+
+static bool installPollHook(void* p1obj, void* p2obj) {
+    wireKeyManagers(p1obj, p2obj);
+    s_kmm[0] = keymapManagerOf(p1obj);
+    s_kmm[1] = keymapManagerOf(p2obj);
+    if (!s_kmm[0] || !s_kmm[1]) {
+        sfe::log("pollHook: no KeymapManager (p1=%p p2=%p) -- char+0x750 is "
+                 "null, so 0x0046C8E0 skips the copy entirely and this player "
+                 "is not driven from a manager at all", s_kmm[0], s_kmm[1]);
+        return false;
+    }
+    DWORD* v1 = *reinterpret_cast<DWORD**>(s_kmm[0]);
+    DWORD* v2 = *reinterpret_cast<DWORD**>(s_kmm[1]);
+    if (v1 != v2)
+        sfe::log("pollHook: WARNING p1 and p2 managers have different vtables "
+                 "(%p vs %p); only p1's is patched", v1, v2);
+    DWORD oldProt = 0;
+    if (!VirtualProtect(v1, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        sfe::log("pollHook: VirtualProtect on %p failed (GLE=%lu)", v1,
+                 GetLastError());
+        return false;
+    }
+    s_kmm_vtbl       = v1;
+    s_orig_kmm_poll  = reinterpret_cast<PFN_sceneProcess>(v1[1]);
+    v1[1]            = reinterpret_cast<DWORD>(HookedKeymapPoll);
+    DWORD tmp = 0;
+    VirtualProtect(v1, 8 * sizeof(DWORD), oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    sfe::log("pollHook: installed on vtable %p slot 1 (orig=%p); "
+             "p1 kmm=%p p2 kmm=%p", v1,
+             reinterpret_cast<void*>(s_orig_kmm_poll), s_kmm[0], s_kmm[1]);
+    return true;
+}
+
+static void restorePollHook() {
+    if (!s_kmm_vtbl || !s_orig_kmm_poll) return;
+    DWORD oldProt = 0;
+    if (VirtualProtect(s_kmm_vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        s_kmm_vtbl[1] = reinterpret_cast<DWORD>(s_orig_kmm_poll);
+        DWORD tmp = 0;
+        VirtualProtect(s_kmm_vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+        sfe::log("pollHook: restored after %ld poll(s)", s_poll_calls);
+    }
+    s_kmm_vtbl      = nullptr;
+    s_orig_kmm_poll = nullptr;
+}
+
+// -------------------------------------------------------------------------
+// Who writes keyMap?
+// -------------------------------------------------------------------------
+// Six injection attempts have now failed for six different reasons, and every
+// one of them was a guess about where the engine takes its input from:
+// keyMap at onProcess entry (refilled after us), keyMap at swap (a tick late),
+// inKeys under replay submode (ignored), the KeymapManagers under a PLAYING
+// submode (character not wired to them -- char+0x750 is null), the replay
+// decode buffer (works, but its address moves with the replay), and a cold VS
+// start with no replay at all (still fed from somewhere).
+//
+// Guessing is the expensive part. The game knows the answer: some instruction
+// writes char+0x754 every tick, and asking which one is a single run.
+//
+// PAGE_GUARD rather than a debug register, because Wine's DR emulation is not
+// something to bet the answer on, and the guard fault carries what is needed
+// anyway: ExceptionInformation[0] says read (0) or write (1) and [1] carries
+// the faulting address, so writes landing in the eight ints at 0x754 can be
+// separated from the rest of the traffic on a very hot page. The guard clears
+// itself when it fires, so it is re-armed once per tick from the pre-tick
+// hook -- which means one writer is caught per frame and the distinct ones
+// accumulate over a few hundred frames.
+constexpr int  WATCH_MAX_SITES = 16;
+static DWORD   s_watch_site[WATCH_MAX_SITES];
+static int     s_watch_hits[WATCH_MAX_SITES];
+static int     s_watch_n     = 0;
+static DWORD   s_watch_lo    = 0;   // char+0x754
+static DWORD   s_watch_hi    = 0;   // char+0x774
+static void*   s_watch_veh   = nullptr;
+static bool    s_watch_on    = false;
+
+static LONG CALLBACK watchHandler(EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode == STATUS_SINGLE_STEP) {
+        const DWORD eip = ep->ContextRecord->Eip;
+        int i = 0;
+        for (; i < s_watch_n; ++i)
+            if (s_watch_site[i] == eip) { ++s_watch_hits[i]; break; }
+        if (i == s_watch_n && s_watch_n < WATCH_MAX_SITES) {
+            s_watch_site[s_watch_n] = eip;
+            s_watch_hits[s_watch_n] = 1;
+            ++s_watch_n;
+            sfe::log("watch: keyMap written from EIP 0x%08lX", eip);
+        }
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (er->ExceptionCode != STATUS_GUARD_PAGE_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1) {
+        const DWORD at = static_cast<DWORD>(er->ExceptionInformation[1]);
+        if (at >= s_watch_lo && at < s_watch_hi) {
+            const DWORD eip = ep->ContextRecord->Eip;
+            int i = 0;
+            for (; i < s_watch_n; ++i)
+                if (s_watch_site[i] == eip) { ++s_watch_hits[i]; break; }
+            if (i == s_watch_n && s_watch_n < WATCH_MAX_SITES) {
+                s_watch_site[s_watch_n] = eip;
+                s_watch_hits[s_watch_n] = 1;
+                ++s_watch_n;
+                sfe::log("watch: keyMap+0x%lX written from EIP 0x%08lX",
+                         at - s_watch_lo, eip);
+            }
+        }
+    }
+    // The guard is already gone -- that is how PAGE_GUARD works -- so the
+    // faulting instruction simply reruns and succeeds.
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// PAGE_GUARD marks a whole page and clears on the FIRST access of any kind.
+// The character struct is hot, so the first access every frame is a read of a
+// neighbouring field, the guard is spent before keyMap is written, and the
+// filter never matches -- measured: armed cleanly, caught nothing.
+//
+// A debug register watches exactly four bytes for writes only, which is the
+// question being asked. Dr0 holds the address; in Dr7, L0 enables it, RW0=01
+// selects write-only, and LEN0=11 selects four bytes.
+static bool armHardwareWatch(DWORD addr) {
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    HANDLE th = GetCurrentThread();
+    if (!GetThreadContext(th, &ctx)) {
+        sfe::log("watch: GetThreadContext failed (GLE=%lu)", GetLastError());
+        return false;
+    }
+    ctx.Dr0 = addr;
+    ctx.Dr7 = (ctx.Dr7 & ~0xF000Ful) | 0x1ul | (0x1ul << 16) | (0x3ul << 18);
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!SetThreadContext(th, &ctx)) {
+        sfe::log("watch: SetThreadContext failed (GLE=%lu)", GetLastError());
+        return false;
+    }
+    sfe::log("watch: hardware write watch armed on 0x%08lX", addr);
+    return true;
+}
+
+static void watchArm(void* char_obj) {
+    if (!getenv("SFE_WATCH_WRITER") || !char_obj) return;
+    if (!s_watch_on) {
+        s_watch_veh = AddVectoredExceptionHandler(1, watchHandler);
+        if (!s_watch_veh) { sfe::log("watch: AddVectoredExceptionHandler failed"); return; }
+        s_watch_lo = reinterpret_cast<DWORD>(char_obj) + CHAR_INPUT_OFFSET;
+        s_watch_hi = s_watch_lo + sizeof(SWRCHARINPUT);
+        s_watch_on = true;
+        sfe::log("watch: armed on 0x%08lX..0x%08lX (p1 keyMap)", s_watch_lo, s_watch_hi);
+        if (getenv("SFE_WATCH_HW")) armHardwareWatch(s_watch_lo);
+    }
+    if (getenv("SFE_WATCH_HW")) return;   // armed once, stays armed
+    DWORD old = 0;
+    VirtualProtect(reinterpret_cast<void*>(s_watch_lo), sizeof(SWRCHARINPUT),
+                   PAGE_READWRITE | PAGE_GUARD, &old);
+}
+
+static void watchReport() {
+    if (!s_watch_on) return;
+    sfe::log("watch: %d distinct writer(s) of p1 keyMap", s_watch_n);
+    for (int i = 0; i < s_watch_n; ++i)
+        sfe::log("  EIP 0x%08lX  %d hit(s)", s_watch_site[i], s_watch_hits[i]);
+}
+
+// -------------------------------------------------------------------------
+// Sweeping the candidates: which mirror is the one the engine reads?
+// -------------------------------------------------------------------------
+// Writing keyMap at onProcess entry changed nothing -- 7 transient frames out
+// of 6002 differed and none of them were in the forced window -- because the
+// engine refills keyMap from its own source further inside the tick. Entry is
+// too early and the swap hook is too late, so the write has to go to that
+// source instead, before the refill reads it. The mirror scan already found
+// every address that holds this tick's word; one of them is it.
+//
+// Rather than reason about which, write each in turn and let the game answer.
+// The capture already reads keyMap after the tick, so if a candidate is the
+// real source, the input column for those frames comes back as the forced word
+// -- measured on the same rows the corpus is built from, with no extra
+// machinery to be wrong about.
+// Monotonic across the whole capture, unlike the battle frame counter, which
+// resets every round -- a window scheduled on that would reopen once a round.
+static long s_bm_calls = 0;
+
+constexpr long SWEEP_WIN = 40;   // frames forced per candidate
+constexpr long SWEEP_GAP = 20;   // frames of quiet between, to re-settle
+constexpr int  SWEEP_MAX = 64;
+
+static long           s_sweep_base     = -1;
+static int            s_sweep_active   = -1;   // candidate index, -1 between windows
+static int            s_sweep_hit[SWEEP_MAX]  = {};
+static int            s_sweep_tot[SWEEP_MAX]  = {};
+static bool           s_sweep_reported = false;
+static int            s_sweep_player   = 1;
+static unsigned short s_sweep_word     = 0x0005;
+
+// A winning address is only useful if it can be found again. It is on the
+// heap, so it moves every run; what has to be established is which stable
+// thing it sits at a fixed offset from. Print the candidate anchors and let
+// the offsets say which one is constant across runs.
+static void dumpAnchors(int n) {
+    void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
+    if (!bm) return;
+    void* obj[2] = {
+        *reinterpret_cast<void**>(reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET),
+        *reinterpret_cast<void**>(reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET),
+    };
+    DWORD anchor[8];
+    const char* name[8];
+    int na = 0;
+    anchor[na] = reinterpret_cast<DWORD>(bm);       name[na++] = "battleMgr";
+    for (int p = 0; p < 2; ++p) {
+        anchor[na] = reinterpret_cast<DWORD>(obj[p]);
+        name[na++] = p == 0 ? "p1obj" : "p2obj";
+        __try {
+            auto* km = *reinterpret_cast<void**>(
+                           reinterpret_cast<char*>(obj[p]) + 0x750);
+            anchor[na] = reinterpret_cast<DWORD>(km);
+            name[na++] = p == 0 ? "p1->keyMgr" : "p2->keyMgr";
+            anchor[na] = reinterpret_cast<DWORD>(*reinterpret_cast<void**>(km));
+            name[na++] = p == 0 ? "p1->keymapMgr" : "p2->keymapMgr";
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    for (int i = 0; i < na; ++i)
+        sfe::log("  anchor %-14s = 0x%08lX", name[i], anchor[i]);
+    const int who = s_sweep_player - 1;
+    for (int i = 0; i < n; ++i) {
+        char line[240];
+        int k = snprintf(line, sizeof(line), "  0x%08lX offsets:",
+                         s_mirror[who][i]);
+        for (int j = 0; j < na; ++j)
+            k += snprintf(line + k, sizeof(line) - k, " %s%+ld",
+                          name[j],
+                          static_cast<long>(s_mirror[who][i]) -
+                          static_cast<long>(anchor[j]));
+        sfe::log("%s", line);
+    }
+}
+
+static void sweepReport(int n) {
+    const int who = s_sweep_player - 1;
+    sfe::log("sweep: results for p%d, forced word 0x%04X", s_sweep_player,
+             s_sweep_word);
+    for (int i = 0; i < n; ++i) {
+        char note[128];
+        mirrorAnnotate(s_mirror[who][i], nullptr, note, sizeof(note));
+        sfe::log("  candidate 0x%08lX%s -- keyMap took the forced word on "
+                 "%d of %d frames", s_mirror[who][i], note,
+                 s_sweep_hit[i], s_sweep_tot[i]);
+    }
+    dumpAnchors(n);
+}
+
+// Called from the pre-tick hook, before the engine refills keyMap.
+static void sweepStep() {
+    if (!s_mirror_done || !getenv("SFE_SWEEP")) { s_sweep_active = -1; return; }
+    const int who = s_sweep_player - 1;
+    int n = s_mirror_n[who];
+    if (n > SWEEP_MAX) n = SWEEP_MAX;
+    if (n <= 0) { s_sweep_active = -1; return; }
+
+    if (s_sweep_base < 0) {
+        s_sweep_base = s_bm_calls;
+        sfe::log("sweep: %d candidate(s) for p%d, forcing 0x%04X in %ld-frame "
+                 "windows", n, s_sweep_player, s_sweep_word, SWEEP_WIN);
+    }
+    const long t   = s_bm_calls - s_sweep_base;
+    const long k   = t / (SWEEP_WIN + SWEEP_GAP);
+    const long pos = t % (SWEEP_WIN + SWEEP_GAP);
+    if (k >= n) {
+        if (!s_sweep_reported) { sweepReport(n); s_sweep_reported = true; }
+        s_sweep_active = -1;
+        return;
+    }
+    if (pos >= SWEEP_WIN) { s_sweep_active = -1; return; }
+
+    s_sweep_active = static_cast<int>(k);
+    if (pos == 0)
+        sfe::log("sweep: candidate %ld = 0x%08lX", k, s_mirror[who][k]);
+    __try {
+        *reinterpret_cast<volatile unsigned short*>(s_mirror[who][k])
+            = s_sweep_word;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Called from the capture, after the tick has run, with the swept player's
+// word as the character actually consumed it.
+static void sweepObserve(unsigned short w) {
+    const int k = s_sweep_active;
+    if (k < 0 || k >= SWEEP_MAX) return;
+    ++s_sweep_tot[k];
+    if (w == s_sweep_word) ++s_sweep_hit[k];
+}
+
+// -------------------------------------------------------------------------
+// The pre-update injection point
+// -------------------------------------------------------------------------
+// char+0x754 is what the character logic consumes, and writing it as a
+// SWRCHARINPUT does land -- but from the swap hook it lands after the fact.
+// Measured: the captured p1_input column showed the forced word while p1_x
+// stayed bit-identical to the clean run, because the character had already
+// moved on that tick. The write was real and too late.
+//
+// So it has to happen inside the tick: after the engine has filled keyMap from
+// whatever source it is using this run -- replay stream, device, or netplay's
+// inKeys -- and before the characters update. SokuLib documents that boundary.
+// BattleManager's third virtual is the update that runs
+//
+//     for (p : players) { ...; p->update(); ...; p->updatePhysics(); }
+//
+// so entering it is after the fill and before the first p->update(). Hooking
+// BattleManager's vtable rather than the scene's also scopes the hook to a
+// battle, which is the only time any of these offsets mean anything.
+//
+// PAGE_READWRITE, not PAGE_WRITECOPY: the latter silently fails on .rdata
+// under Wine and leaves the patch unapplied, which is how an earlier attempt
+// at this same vtable came back looking like the hook never fired.
+constexpr DWORD ADDR_VTBL_BATTLE_MANAGER = 0x008588EC;
+
+static PFN_sceneProcess s_orig_bm_update = nullptr;
+static DWORD*           s_bm_vtbl        = nullptr;
+static int              s_bm_slot        = 2;
+static bool             s_bm_hooked      = false;
+
+// The same eight ints readPlayerInput reads, packed back to a word. A free
+// function because the hook is not a Session member and must not need one.
+static unsigned short peekKeyMap(void* char_obj) {
+    if (!char_obj) return 0;
+    auto* i = reinterpret_cast<volatile SWRCHARINPUT*>(
+        reinterpret_cast<char*>(char_obj) + CHAR_INPUT_OFFSET);
+    unsigned short w = 0;
+    if (i->lr < 0) w |= INPUT_LEFT;  else if (i->lr > 0) w |= INPUT_RIGHT;
+    if (i->ud < 0) w |= INPUT_UP;    else if (i->ud > 0) w |= INPUT_DOWN;
+    if (i->a)  w |= INPUT_A;
+    if (i->b)  w |= INPUT_B;
+    if (i->c)  w |= INPUT_C;
+    if (i->d)  w |= INPUT_D;
+    if (i->ch) w |= INPUT_CHANGE;
+    if (i->s)  w |= INPUT_SPELL;
+    return w;
+}
+
+struct InjectCfg {
+    bool           armed;
+    long           frame, len;
+    int            player;   // 1, 2, or 3 for both
+    unsigned short word;
+};
+static InjectCfg s_inject      = { false, 0, 0, 1, 0 };
+static bool      s_inject_read = false;
+
+static void injectInit() {
+    if (s_inject_read) return;
+    s_inject_read = true;
+    const char* sp = getenv("SFE_SWEEP_PLAYER");
+    const char* sw = getenv("SFE_SWEEP_WORD");
+    if (sp && *sp) s_sweep_player = static_cast<int>(strtol(sp, nullptr, 10));
+    if (sw && *sw) s_sweep_word   = static_cast<unsigned short>(strtol(sw, nullptr, 0));
+    const char* fr = getenv("SFE_INJECT_FRAME");
+    if (!fr || !*fr) return;
+    const char* le = getenv("SFE_INJECT_LEN");
+    const char* wd = getenv("SFE_INJECT_WORD");
+    const char* pl = getenv("SFE_INJECT_PLAYER");
+    s_inject.frame  = strtol(fr, nullptr, 10);
+    s_inject.len    = le && *le ? strtol(le, nullptr, 10) : 60;
+    s_inject.word   = static_cast<unsigned short>(
+                          wd && *wd ? strtol(wd, nullptr, 0) : 0);
+    s_inject.player = pl && *pl ? static_cast<int>(strtol(pl, nullptr, 10)) : 1;
+    s_inject.armed  = true;
+    sfe::log("inject: player %d word 0x%04X battle frames %ld..%ld",
+             s_inject.player, s_inject.word, s_inject.frame,
+             s_inject.frame + s_inject.len - 1);
+}
+
+static int __fastcall HookedBattleUpdate(void* This, void* edx) {
+    injectInit();
+    // `This` is the scene now, not the BattleManager, so the frame counter and
+    // the two characters come from the manager the same way the capture reads
+    // them -- which also keeps the two paths reading one source of truth.
+    void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
+    sweepStep();
+    if (bm) {
+        watchArm(*reinterpret_cast<void**>(
+            reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET));
+        if (s_bm_calls == 400) watchReport();
+    }
+    // Is this slot the per-frame update at all? "VUnknown08 // maybe update"
+    // is SokuLib's own confidence level, and a slot called once a round looks
+    // identical to a working hook until the frame window never opens -- which
+    // is exactly what the first run showed.
+    if (++s_bm_calls <= 3 || s_bm_calls % 600 == 0) {
+        const long f = bm ? static_cast<long>(
+            *reinterpret_cast<volatile uint32_t*>(
+                reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET)) : -1;
+        sfe::log("preTick: call %ld, scene=%p bm=%p frameCount=%ld",
+                 s_bm_calls, This, bm, f);
+    }
+    if (s_inject.armed && bm) {
+        const long f = static_cast<long>(
+            *reinterpret_cast<volatile uint32_t*>(
+                reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET));
+        if (f >= s_inject.frame && f < s_inject.frame + s_inject.len) {
+            for (int p = 1; p <= 2; ++p) {
+                if (s_inject.player != 3 && s_inject.player != p) continue;
+                void* obj = *reinterpret_cast<void**>(
+                    reinterpret_cast<char*>(bm)
+                    + (p == 1 ? BM_PLAYER1_OFFSET : BM_PLAYER2_OFFSET));
+                if (!obj) continue;
+                // Log the boundary frames only. What the engine had just put
+                // there is the interesting half: if keyMap is already the
+                // forced word on the frame after the window opens, something
+                // upstream is echoing us rather than the hook doing the work.
+                if (f == s_inject.frame || f == s_inject.frame + 1) {
+                    sfe::log("inject: frame %ld p%d keyMap was 0x%04X, forcing 0x%04X",
+                             f, p, peekKeyMap(obj), s_inject.word);
+                    if (p == 1) {
+                        void* o2 = *reinterpret_cast<void**>(
+                            reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
+                        dumpKeymapManagers(obj, o2);
+                    }
+                }
+                // Arm the poll hook rather than writing anything here: the
+                // value has to land after 0x46c900 and before 0x46c92e, and
+                // this hook is outside that window on both sides.
+                s_kmm_drive[p - 1] = true;
+                s_kmm_word[p - 1]  = s_inject.word;
+                const char* via = getenv("SFE_INJECT_VIA");
+                if (via && strcmp(via, "old") == 0) {
+                    forceViaKeymap(obj, p, s_inject.word);
+                    forceOne(obj, s_inject.word);
+                }
+            }
+        } else if (f >= s_inject.frame + s_inject.len) {
+            s_kmm_drive[0] = s_kmm_drive[1] = false;
+        }
+        if (f == s_inject.frame + s_inject.len) {
+            void* obj = *reinterpret_cast<void**>(
+                reinterpret_cast<char*>(bm)
+                + (s_inject.player == 2 ? BM_PLAYER2_OFFSET : BM_PLAYER1_OFFSET));
+            sfe::log("inject: frame %ld window closed, keyMap now 0x%04X",
+                     f, peekKeyMap(obj));
+        }
+    }
+    return s_orig_bm_update(This, edx);
+}
+
+static bool installPreTickHook() {
+    // Which vtable, decided by looking rather than by naming a constant.
+    // SokuLib has four battle scene classes -- Battle, BattleServer,
+    // BattleClient, BattleWatch -- with four different vtables, and replay
+    // playback does not obviously use the first. Reading the pointer off the
+    // live scene object gets the right one without having to know which, and
+    // logging it says which it turned out to be.
+    //
+    // Slot 1 is IScene::onProcess: `virtual int onProcess()`, no arguments.
+    // That matters for more than correctness. A blind slot sweep is not
+    // available here -- a __thiscall virtual that takes arguments expects the
+    // callee to clean them (`ret N`), while this hook's __fastcall thunk
+    // returns with `ret`, so hooking a slot with a different signature
+    // unbalances the stack and crashes. onProcess is the one slot whose
+    // signature is documented and argument-free.
+    void* scene = currentSceneObject();
+    if (!scene) return false;
+    DWORD* vtbl = *reinterpret_cast<DWORD**>(scene);
+    if (!vtbl) {
+        sfe::log("ERROR: battle scene %p has a null vtable", scene);
+        return false;
+    }
+    const char* sv = getenv("SFE_HOOK_SLOT");
+    s_bm_slot = sv && *sv ? static_cast<int>(strtol(sv, nullptr, 10))
+                          : VTBL_SCENE_ONPROCESS;
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        sfe::log("ERROR: VirtualProtect on battle scene vtable %p failed (GLE=%lu)",
+                 vtbl, GetLastError());
+        return false;
+    }
+    s_bm_vtbl        = vtbl;
+    s_orig_bm_update = reinterpret_cast<PFN_sceneProcess>(vtbl[s_bm_slot]);
+    vtbl[s_bm_slot]  = reinterpret_cast<DWORD>(HookedBattleUpdate);
+
+    DWORD tmp = 0;
+    VirtualProtect(vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+
+    const char* which = vtbl == reinterpret_cast<DWORD*>(0x008574A0) ? "Battle"
+                      : vtbl == reinterpret_cast<DWORD*>(0x0085758C) ? "BattleWatch"
+                      : vtbl == reinterpret_cast<DWORD*>(0x00857518) ? "BattleServer"
+                      : vtbl == reinterpret_cast<DWORD*>(0x00857570) ? "BattleClient"
+                      : "unrecognised";
+    sfe::log("Pre-tick hook installed: scene=%p vtbl=%p (%s) slot=%d orig=%p",
+             scene, vtbl, which, s_bm_slot,
+             reinterpret_cast<void*>(s_orig_bm_update));
+    return true;
+}
+
+static void restorePreTickHook() {
+    if (!s_bm_vtbl || !s_orig_bm_update) return;
+    DWORD oldProt = 0;
+    if (VirtualProtect(s_bm_vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) {
+        s_bm_vtbl[s_bm_slot] = reinterpret_cast<DWORD>(s_orig_bm_update);
+        DWORD tmp = 0;
+        VirtualProtect(s_bm_vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+        sfe::log("Pre-tick hook restored");
+    }
+    s_bm_vtbl        = nullptr;
+    s_orig_bm_update = nullptr;
+    s_bm_hooked      = false;
 }
 
 // =========================================================================
@@ -570,6 +1758,8 @@ void Session::shutdown() {
     // are 12 crash dumps in the tree consistent with that.
     if (m_scene_hooked) {
         restoreSceneHook();
+        restorePreTickHook();
+        restorePollHook();
         m_scene_hooked = false;
     }
 
@@ -581,7 +1771,7 @@ void Session::shutdown() {
             DWORD tmp = 0;
             VirtualProtect(vtbl, 16 * sizeof(DWORD), oldProt, &tmp);
             FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
-            sfe::log("BattleManager vtable restored");
+            sfe::log("Pre-tick hook restored");
         } else {
             sfe::log("WARNING: could not restore vtable (GLE=%lu)", GetLastError());
         }
@@ -762,6 +1952,16 @@ FrameTag Session::onFrame() {
         uint32_t battle_frame = 0;
         sfe::PlayerState p1s, p2s;
         if (void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER)) {
+            // Lazily, because the BattleManager does not exist until a battle
+            // does -- and its vtable is what carries the pre-update hook.
+            if (!s_bm_hooked) {
+                s_bm_hooked = installPreTickHook();
+                installPollHook(
+                    *reinterpret_cast<void**>(
+                        reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET),
+                    *reinterpret_cast<void**>(
+                        reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET));
+            }
             // The engine's own battle tick. Recorded because `m_frame_index`
             // cannot identify a moment in the match: it is this capture's row
             // number and starts at 0 wherever the capture armed, which is not
@@ -776,6 +1976,13 @@ FrameTag Session::onFrame() {
                               reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
             void* p2obj = *reinterpret_cast<void**>(
                               reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
+            // FORCE, then read, so the CSV records what was written and the
+            // read-back on the following frame says whether it survived. The
+            // ordering question -- does this hook run between the replay's
+            // input fill and the character logic, or after both -- is settled
+            // by the state diverging or not, which is cheaper to test than to
+            // reason about from the frame loop.
+            forceBranchInput(p1obj, p2obj, static_cast<long>(battle_frame));
             p1 = readPlayerInput(p1obj);
             p2 = readPlayerInput(p2obj);
             // Same two objects, same tick, one more read each. Position and
@@ -788,9 +1995,25 @@ FrameTag Session::onFrame() {
             // -- and that position is only known once both states are read.
             sfe::readProjectiles(p1obj, p2s.x, p2s.y, &p1s);
             sfe::readProjectiles(p2obj, p1s.x, p1s.y, &p2s);
+            // Where does this tick's word live? Answered from the same two
+            // objects, on frames the game is already being read on.
+            mirrorScan(p1, p2, p1obj, p2obj);
+            sweepObserve(s_sweep_player == 2 ? p2 : p1);
         }
 
         tag.capture      = true;
+        // SCAN AND PATCH DURING PLAYBACK, NOT AT LOAD.
+        //
+        // The buffer readReplay() produces is a transient decode scratch --
+        // patching it changed nothing, because the game re-reads the inputs
+        // from elsewhere once the battle starts. Measured: the hit sat at
+        // offset 0xFD934 of a 1 MB PAGE_READWRITE region, and the branched run
+        // was byte-identical to the clean one. So do it here, on a battle
+        // frame, when the buffer the game is actually consuming exists.
+        if (m_frame_index == branchScanFrame()) {
+            scanForNeedle();
+            applyBranch();
+        }
         tag.frame_index  = m_frame_index;
         tag.battle_frame = battle_frame;
         tag.p1_input    = p1;
