@@ -1236,10 +1236,71 @@ static unsigned short policyWord(int i, int toward, float dist, int elapsed) {
     }
 }
 
+// -------------------------------------------------------------------------
+// Ground truth: what does the stick ACTUALLY do?
+// -------------------------------------------------------------------------
+// Every number this project has on blocking is a ratio between two models. The
+// quantity none of them is measured against is the real one: hold the same
+// situation and press away instead of toward, and how much more often does the
+// defender end up guarding? The corpus cannot answer that -- it never contains
+// one state played two ways -- but the game can, now that its input is ours.
+//
+// Self-play is deterministic given (replay, seed, policy), so two runs that
+// differ only inside a forced window are a genuine counterfactual pair:
+// everything before it is bit-identical, and the difference after it is an
+// interventional effect with the attacker's inputs held fixed.
+//
+// Only the DIRECTION bits are overridden, not the whole word. Forcing an
+// entire input would also silence whatever attack the defender was throwing,
+// which is a different intervention from the one the model is asked about --
+// state_action_effect flips left/right and leaves the rest alone, so this must
+// too, or the two numbers are not comparable.
+struct CFCfg { bool armed; int player; long frame, len; int dir; };
+static CFCfg s_cf = { false, 1, 0, 0, 0 };
+static bool  s_cf_read = false;
+
+static void cfInit() {
+    if (s_cf_read) return;
+    s_cf_read = true;
+    const char* fr = getenv("SFE_CF_FRAME");
+    if (!fr || !*fr) return;
+    const char* le = getenv("SFE_CF_LEN");
+    const char* pl = getenv("SFE_CF_PLAYER");
+    const char* di = getenv("SFE_CF_DIR");
+    s_cf.frame  = strtol(fr, nullptr, 10);
+    s_cf.len    = le && *le ? strtol(le, nullptr, 10) : 30;
+    s_cf.player = pl && *pl ? static_cast<int>(strtol(pl, nullptr, 10)) : 1;
+    s_cf.dir    = di && *di ? static_cast<int>(strtol(di, nullptr, 10)) : 1;
+    s_cf.armed  = true;
+    sfe::log("cf: player %d %s for battle frames %ld..%ld",
+             s_cf.player, s_cf.dir > 0 ? "AWAY" : "TOWARD",
+             s_cf.frame, s_cf.frame + s_cf.len - 1);
+}
+
+static void cfApply(long f, int toward1) {
+    if (!s_cf.armed) return;
+    if (f < s_cf.frame || f >= s_cf.frame + s_cf.len) return;
+    const int i = s_cf.player - 1;
+    // `toward1` is p1's toward direction; p2's is its negation.
+    const int toward = (i == 0) ? toward1 : -toward1;
+    const int want = (s_cf.dir > 0) ? -toward : toward;   // away flips it
+    unsigned short w = s_kmm_word[i];
+    w = static_cast<unsigned short>(w & ~(INPUT_LEFT | INPUT_RIGHT));
+    w = static_cast<unsigned short>(w | (want > 0 ? INPUT_RIGHT : INPUT_LEFT));
+    s_kmm_word[i] = w;
+}
+
 // Both players, once per tick, from the pre-tick hook -- ahead of the poll that
 // the injection hook rides on.
-static void policyDrive(void* bm) {
+static void policyDrive(void* bm, long frame) {
     if (!s_selfplay || !bm) return;
+    cfInit();
+    // NOT keyed to battle_frame. That was tried, on the theory that a tick the
+    // hook saw twice would advance the schedule twice: it made two runs of the
+    // same seed disagree on 602 of 656 pre-window frames instead of 6, because
+    // the battle frame counter FREEZES during hitstop. Keying to it stalls the
+    // policy whenever someone is hit, which couples the schedule to the match
+    // and amplifies divergence rather than removing it.
     void* p1obj = *reinterpret_cast<void**>(
         reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
     void* p2obj = *reinterpret_cast<void**>(
@@ -1253,6 +1314,7 @@ static void policyDrive(void* bm) {
     s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d,
                                 PM_MAX[s_pol[1].mode] - s_pol[1].left);
     s_kmm_drive[0] = s_kmm_drive[1] = true;
+    cfApply(frame, x2 >= x1 ? 1 : -1);
 }
 
 static void policyInit() {
@@ -1673,7 +1735,8 @@ static int __fastcall HookedBattleUpdate(void* This, void* edx) {
     // the two characters come from the manager the same way the capture reads
     // them -- which also keeps the two paths reading one source of truth.
     void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
-    policyDrive(bm);
+    policyDrive(bm, bm ? static_cast<long>(*reinterpret_cast<volatile uint32_t*>(
+        reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET)) : 0);
     sweepStep();
     if (bm) {
         watchArm(*reinterpret_cast<void**>(
