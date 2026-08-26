@@ -1051,6 +1051,206 @@ static void wireKeyManagers(void* p1obj, void* p2obj) {
     }
 }
 
+// -------------------------------------------------------------------------
+// The behaviour policy
+// -------------------------------------------------------------------------
+// This exists to produce training data the world model can learn a CAUSE from,
+// which is a different requirement from producing good play.
+//
+// Measured on a proxy built to reproduce this game's pathologies, across eight
+// seeds: a model fit on confounded logs recovers 28% of the true causal effect
+// of an action, while the same model fit on unconfounded on-policy logs
+// recovers 91%, statistically indistinguishable from explicit counterfactual
+// pairs at 105%. Two properties are doing that work, and both are design
+// constraints here rather than nice-to-haves.
+//
+// FIRST: mode transitions are EXOGENOUS. A human's decision to block comes from
+// an intent the logs never contain, and that hidden intent is a back-door path
+// from action to next state -- it is exactly what caps the human corpus at 28%.
+// Here the mode is drawn from a fixed distribution on a schedule that no game
+// state touches. Only the DIRECTION a mode resolves to reads the world, and it
+// reads position, which every row records. So the behaviour policy conditions
+// on nothing that is not logged, which is the back-door criterion.
+//
+// SECOND: exploration is TEMPORALLY CORRELATED. Per-frame epsilon-greedy looks
+// like exploration and is not: a stance that must survive five frames survives
+// 0.82^5 = 0.37 of the time, and on the proxy that under-sampled every
+// multi-frame mechanic about threefold -- guarding appeared on 0.2% of frames
+// against a real rate near 4%. Blocking IS a multi-frame commitment, so a mode
+// is held for a sampled run of frames and the run length is the exploration.
+//
+// Weights favour the interaction that has to be in the data: someone pressing
+// forward with an attack while the other holds away. Blocking is not a mode the
+// game has -- holding away from an incoming attack IS the block -- so RETREAT
+// carries a long duration, long enough to cover an attack's startup and the
+// blockstun after it.
+enum PolicyMode {
+    PM_NEUTRAL, PM_APPROACH, PM_RETREAT, PM_MELEE,
+    PM_BULLET, PM_JUMP, PM_CROUCH, PM_DASH, PM_COUNT
+};
+
+static const int PM_WEIGHT[PM_COUNT] = { 6, 24, 30, 18, 16, 5, 3, 4 };
+static const int PM_MIN[PM_COUNT]    = {  6,  8, 14,  4,  4,  8,  6,  5 };
+static const int PM_MAX[PM_COUNT]    = { 24, 30, 50, 14, 12, 22, 18, 14 };
+
+struct PolicyState { int mode; int left; unsigned short extra; };
+static PolicyState s_pol[2] = {};
+// Pinning a player to one mode is how the blocking path gets tested directly
+// rather than waited for: p1 retreating into p2's melee should produce guard
+// frames on p1, and if it does not, the fault is the policy's direction sign
+// and not a sampling rate.
+static int s_force_mode[2] = { -1, -1 };
+
+// Per-player, per-match style, drawn once at init. A single tuned weight vector
+// produced a lopsided match -- p1 attacked so constantly it was never in a
+// blockable state and guarded on 0.00% of frames while p2 guarded on 2.33% --
+// and the fix is not to hand-tune the vector until that stops. Tuning one point
+// is how the proxy got rejected twice, and a world model wants blocking seen
+// across many contexts rather than at one aggression level. So each player
+// draws its own scaling of the base weights, between half and double, and the
+// corpus covers turtles, rushdown, and everything between.
+static int s_weight[2][PM_COUNT];
+static unsigned int s_rng   = 0x9E3779B9u;
+static bool         s_selfplay = false;
+
+static unsigned int rnd32() {
+    unsigned int x = s_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return s_rng = x;
+}
+static int rndRange(int lo, int hi) {   // inclusive
+    return lo + static_cast<int>(rnd32() % static_cast<unsigned>(hi - lo + 1));
+}
+
+static void policyPick(int i) {
+    int total = 0;
+    for (int m = 0; m < PM_COUNT; ++m) total += s_weight[i][m];
+    int r = static_cast<int>(rnd32() % static_cast<unsigned>(total));
+    int m = 0;
+    while (m < PM_COUNT - 1 && r >= s_weight[i][m]) { r -= s_weight[i][m]; ++m; }
+    s_pol[i].mode = m;
+    s_pol[i].left = rndRange(PM_MIN[m], PM_MAX[m]);
+    // Chosen once per mode, not per frame, for the same reason the mode is:
+    // a button that changes every frame is not a decision the dynamics can
+    // show a consequence for.
+    switch (m) {
+        case PM_BULLET: s_pol[i].extra = (rnd32() & 1) ? INPUT_B : INPUT_C; break;
+        case PM_DASH:   s_pol[i].extra = (rnd32() & 1) ? 1 : 0; break;  // toward/away
+        case PM_JUMP:   s_pol[i].extra = static_cast<unsigned short>(rnd32() % 3); break;
+        default:        s_pol[i].extra = 0; break;
+    }
+}
+
+// Distance thresholds. Measured, not chosen: eight matches of the purely
+// exogenous policy sat at a median separation of 411px with only 20% of frames
+// inside 120px, so melee whiffed almost always and pooled guarding came to
+// 0.79% against the human corpus's 4-6%. Two players who never meet cannot
+// produce a block.
+//
+// The fix reads distance, and that is deliberately safe: distance is a function
+// of p1_x and p2_x, both of which every row records, so a policy conditioning
+// on it still satisfies the back-door criterion. What must never happen is
+// conditioning on something UNRECORDED -- a hidden intent -- which is exactly
+// the confounder that caps the human corpus. The mode schedule stays exogenous;
+// only the action a mode resolves to reads the world.
+constexpr float MELEE_RANGE = 150.0f;   // past this, a melee button just whiffs
+constexpr float DASH_RANGE  = 250.0f;   // past this, walking in is too slow
+
+// `toward` is +1 when the opponent is to the right of this player.
+static unsigned short policyWord(int i, int toward, float dist) {
+    if (s_force_mode[i] >= 0) {
+        s_pol[i].mode = s_force_mode[i];
+        if (--s_pol[i].left <= 0) {
+            s_pol[i].left = PM_MAX[s_pol[i].mode];
+            if (s_pol[i].mode == PM_BULLET)
+                s_pol[i].extra = (rnd32() & 1) ? INPUT_B : INPUT_C;
+        }
+    } else if (--s_pol[i].left <= 0) policyPick(i);
+    const unsigned short fwd  = (toward > 0) ? INPUT_RIGHT : INPUT_LEFT;
+    const unsigned short back = (toward > 0) ? INPUT_LEFT  : INPUT_RIGHT;
+    switch (s_pol[i].mode) {
+        // Walking closes 395px of median separation far too slowly to matter,
+        // so cover ground with the dash button and save the walk for in-range
+        // spacing.
+        case PM_APPROACH: return (dist > DASH_RANGE)
+                                 ? static_cast<unsigned short>(fwd | INPUT_D)
+                                 : fwd;
+        // Holding away IS the block, at EVERY range. Suppressing it when far
+        // apart was tried and made things strictly worse -- pooled guarding
+        // fell from 0.79% to 0.42% -- because most interaction at range is
+        // bullets, and a player not holding back simply gets hit by them
+        // instead of blocking them.
+        case PM_RETREAT:  return back;
+        // Walk in first. Pressing A at 400px is a whiffed animation, and a
+        // whiff neither hits nor gets blocked, so it teaches the dynamics
+        // nothing about either.
+        case PM_MELEE:    return (dist > MELEE_RANGE)
+                                 ? fwd
+                                 : static_cast<unsigned short>(fwd | INPUT_A);
+        case PM_BULLET:   return s_pol[i].extra;
+        case PM_JUMP:     return static_cast<unsigned short>(
+                              INPUT_UP | (s_pol[i].extra == 1 ? fwd
+                                        : s_pol[i].extra == 2 ? back : 0));
+        case PM_CROUCH:   return INPUT_DOWN;
+        case PM_DASH:     return static_cast<unsigned short>(
+                              (s_pol[i].extra ? fwd : back) | INPUT_D);
+        case PM_NEUTRAL:
+        default:          return 0;
+    }
+}
+
+// Both players, once per tick, from the pre-tick hook -- ahead of the poll that
+// the injection hook rides on.
+static void policyDrive(void* bm) {
+    if (!s_selfplay || !bm) return;
+    void* p1obj = *reinterpret_cast<void**>(
+        reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
+    void* p2obj = *reinterpret_cast<void**>(
+        reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
+    if (!p1obj || !p2obj) return;
+    const float x1 = sfe::readPlayerState(p1obj).x;
+    const float x2 = sfe::readPlayerState(p2obj).x;
+    const float d  = x1 > x2 ? x1 - x2 : x2 - x1;
+    s_kmm_word[0]  = policyWord(0, x2 >= x1 ?  1 : -1, d);
+    s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d);
+    s_kmm_drive[0] = s_kmm_drive[1] = true;
+}
+
+static void policyInit() {
+    const char* sp = getenv("SFE_SELFPLAY");
+    if (!sp || !*sp) return;
+    s_selfplay = true;
+    const char* sd = getenv("SFE_SEED");
+    if (sd && *sd) s_rng = static_cast<unsigned int>(strtoul(sd, nullptr, 10));
+    // Mix the replay identity in. One process handles one replay, so without
+    // this every match in a run would draw the same styles and the same mode
+    // schedule -- different characters playing an identical script, which is
+    // far less than N matches of data. FNV-1a over the path: deterministic, so
+    // a run is still reproducible from SFE_SEED alone.
+    for (const char* q = s_replay_path; *q; ++q) {
+        s_rng ^= static_cast<unsigned char>(*q);
+        s_rng *= 16777619u;
+    }
+    if (!s_rng) s_rng = 0x9E3779B9u;   // xorshift is dead at zero
+    const char* fm[2] = { getenv("SFE_P1_MODE"), getenv("SFE_P2_MODE") };
+    for (int i = 0; i < 2; ++i) {
+        for (int m = 0; m < PM_COUNT; ++m) {
+            s_weight[i][m] = PM_WEIGHT[m] * (50 + static_cast<int>(rnd32() % 151)) / 100;
+            if (s_weight[i][m] < 1) s_weight[i][m] = 1;
+        }
+        sfe::log("selfplay: p%d style [%d %d %d %d %d %d %d %d]", i + 1,
+                 s_weight[i][0], s_weight[i][1], s_weight[i][2], s_weight[i][3],
+                 s_weight[i][4], s_weight[i][5], s_weight[i][6], s_weight[i][7]);
+        policyPick(i);
+        s_pol[i].left = 1 + i;
+        if (fm[i] && *fm[i]) {
+            s_force_mode[i] = static_cast<int>(strtol(fm[i], nullptr, 10));
+            sfe::log("selfplay: p%d pinned to mode %d", i + 1, s_force_mode[i]);
+        }
+    }
+    sfe::log("selfplay: behaviour policy armed, seed %u", s_rng);
+}
+
 static bool installPollHook(void* p1obj, void* p2obj) {
     wireKeyManagers(p1obj, p2obj);
     s_kmm[0] = keymapManagerOf(p1obj);
@@ -1434,6 +1634,7 @@ static int __fastcall HookedBattleUpdate(void* This, void* edx) {
     // the two characters come from the manager the same way the capture reads
     // them -- which also keeps the two paths reading one source of truth.
     void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
+    policyDrive(bm);
     sweepStep();
     if (bm) {
         watchArm(*reinterpret_cast<void**>(
@@ -1941,8 +2142,11 @@ FrameTag Session::onFrame() {
             finish(AutoState::DRAINING, nullptr);
             break;
         }
-        if (m_frame_index >= MAX_FRAMES_PER_REPLAY) {
-            sfe::log("Hit MAX_FRAMES_PER_REPLAY (%d)", MAX_FRAMES_PER_REPLAY);
+        const char* mfv = getenv("SFE_MAX_FRAMES");
+        const int max_frames = mfv && *mfv
+            ? static_cast<int>(strtol(mfv, nullptr, 10)) : MAX_FRAMES_PER_REPLAY;
+        if (m_frame_index >= max_frames) {
+            sfe::log("Hit frame cap (%d)", max_frames);
             finish(AutoState::DRAINING, nullptr);
             break;
         }
@@ -1956,6 +2160,7 @@ FrameTag Session::onFrame() {
             // does -- and its vtable is what carries the pre-update hook.
             if (!s_bm_hooked) {
                 s_bm_hooked = installPreTickHook();
+                policyInit();
                 installPollHook(
                     *reinterpret_cast<void**>(
                         reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET),
