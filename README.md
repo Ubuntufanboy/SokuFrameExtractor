@@ -415,10 +415,13 @@ Check `wine.log` and `/proc/<pid>/maps` before concluding otherwise.
 network needed on first run only) and sets `msvcp140=n,b`. Set
 `SFE_SKIP_VCRUN=1` to skip it if you provide the DLLs yourself.
 
-The durable fix is to drop the MSVC C++ STL from the module — Win32
+The durable fix was to drop the MSVC C++ STL from the module — Win32
 `CreateThread` / `CRITICAL_SECTION` / `CONDITION_VARIABLE` instead of
 `std::thread` / `std::mutex` — which removes the redistributable dependency
-entirely. Not done yet.
+entirely. **Done:** `MSVCP140` is no longer in the import table, and
+`cmake/CheckNoMsvcp.cmake` fails the build if it ever returns (so no
+`<mutex>`, `<thread>`, `<fstream>` or `std::string` in `dll/`). The module loads
+with no redistributable installed, so `SFE_SKIP_VCRUN=1` is safe.
 
 ### A crash during module load disables the module behind a modal dialog
 
