@@ -60,6 +60,10 @@ struct FrameTag {
     // drifting apart.
     PlayerState p1_state;
     PlayerState p2_state;
+    // The camera for this same tick. It rides here for exactly the reason the
+    // states do: a world coordinate is meaningless without the transform that
+    // was in effect when the pixels were drawn.
+    CameraState camera;
 };
 
 // Called once per presented frame, on the game thread, BEFORE the pixels are
@@ -177,6 +181,7 @@ private:
         // the state with the tick it belongs to is what prevents that.
         PlayerState p1_state;
         PlayerState p2_state;
+        CameraState camera;
     } m_pbo_metadata[PBO_COUNT] = {};
 
     int          m_pbo_write_idx = 0;         // slot being written this frame

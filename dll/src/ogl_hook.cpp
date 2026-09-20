@@ -397,7 +397,7 @@ void OGLHook::onBeforeSwap() {
         m_pbo_metadata[write_idx] = { tag.frame_index, tag.battle_frame,
                                       tag.p1_input,
                                       tag.p2_input, tag.p1_state,
-                                      tag.p2_state };
+                                      tag.p2_state, tag.camera };
 
         // Step 2: Map and consume the oldest PBO (PBO_COUNT−1 frames old).
         //         By now the GPU DMA into that PBO is guaranteed complete.
@@ -417,6 +417,7 @@ void OGLHook::onBeforeSwap() {
                     slot->p2_input    = meta.p2;
                     slot->p1_state    = meta.p1_state;
                     slot->p2_state    = meta.p2_state;
+                    slot->camera      = meta.camera;
                     m_encoder->ring().commitWriteSlot();
                 }
                 fn_glUnmapBuffer(glconst::PIXEL_PACK_BUFFER);
@@ -449,6 +450,7 @@ void OGLHook::onBeforeSwap() {
             slot->p2_input    = tag.p2_input;
             slot->p1_state    = tag.p1_state;
             slot->p2_state    = tag.p2_state;
+            slot->camera      = tag.camera;
             m_encoder->ring().commitWriteSlot();
         }
     }

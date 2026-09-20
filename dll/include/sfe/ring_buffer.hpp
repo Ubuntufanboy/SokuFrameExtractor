@@ -75,6 +75,9 @@ struct alignas(64) FrameSlot {
     // world model needs to be told these rather than asked to infer them.
     PlayerState p1_state;
     PlayerState p2_state;
+    // Seven floats: without them every positional label in the row is in a
+    // frame the pixels are not.
+    CameraState camera;
 
     // No hand-computed padding any more. `alignas(64)` on the struct already
     // rounds the total up to a multiple of 64, and the metadata grew from 44

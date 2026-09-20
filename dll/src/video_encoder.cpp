@@ -183,6 +183,11 @@ bool VideoEncoder::openOutputs() {
                     p, k, p, k, p, k, p, k, p, k, p, k, p, k);
         }
     }
+    // Camera last, appended after everything that already existed. Seven
+    // floats that turn every world-space label in this row into something a
+    // screen-space model can be supervised against.
+    fputs(",cam_x,cam_y,cam_scale,cam_left,cam_top,cam_right,cam_bottom",
+          m_csv);
     fputc('\n', m_csv);
 
     sfe::log("VideoEncoder: CSV opened %s", m_csv_path);
@@ -355,6 +360,10 @@ void VideoEncoder::encoderLoop() {
                         static_cast<unsigned>(pr.hitboxes));
             }
         }
+        const auto& cam = slot->camera;
+        fprintf(m_csv, ",%.3f,%.3f,%.5f,%.3f,%.3f,%.3f,%.3f",
+                cam.x, cam.y, cam.scale,
+                cam.left, cam.top, cam.right, cam.bottom);
         fputc('\n', m_csv);
 
         m_ring.releaseReadSlot();

@@ -197,3 +197,38 @@ void readProjectiles(void* char_obj, float target_x, float target_y,
 }
 
 }  // namespace sfe
+
+namespace {
+// SokuLib: ADDR_CAMERA_OBJ. A plain global, not a pointer to be chased.
+constexpr uintptr_t ADDR_CAMERA_OBJ = 0x00898600;
+constexpr uintptr_t CAM_TRANSLATE   = 0x0C;
+constexpr uintptr_t CAM_SCALE       = 0x14;
+constexpr uintptr_t CAM_LEFT_EDGE   = 0x5C;
+}  // namespace
+
+sfe::CameraState sfe::readCamera() {
+    CameraState c;
+    const auto base = reinterpret_cast<const unsigned char*>(ADDR_CAMERA_OBJ);
+    if (!base) return c;
+    const auto f = [&](uintptr_t off) {
+        return *reinterpret_cast<const float*>(base + off);
+    };
+    c.x      = f(CAM_TRANSLATE);
+    c.y      = f(CAM_TRANSLATE + 4);
+    c.scale  = f(CAM_SCALE);
+    c.left   = f(CAM_LEFT_EDGE);
+    c.top    = f(CAM_LEFT_EDGE + 4);
+    c.right  = f(CAM_LEFT_EDGE + 8);
+    c.bottom = f(CAM_LEFT_EDGE + 12);
+    // Validate the HORIZONTAL extent only, and do not assume a vertical
+    // ordering. The first version of this also required `bottom > top` and
+    // zeroed every row of a 12 788-frame capture: Soku's world y increases
+    // UPWARD, so `topEdge` holds the larger value and a perfectly good camera
+    // failed the check. A guard that silently blanks the field it is
+    // protecting is worse than no guard, so this one only rejects what it can
+    // actually justify -- a zero-width rectangle, which nothing can divide by.
+    if (!(c.right > c.left)) {
+        return CameraState{};
+    }
+    return c;
+}

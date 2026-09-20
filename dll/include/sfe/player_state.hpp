@@ -300,6 +300,46 @@ struct PlayerState {
 // Reads one character object. Null-safe: the battle manager can be null between
 // scenes, and `readPlayerInput` already returns 0 in that case rather than
 // faulting, so this matches.
+// -------------------------------------------------------------------------
+// THE CAMERA, AND WHY THE LABELS ARE USELESS WITHOUT IT
+// -------------------------------------------------------------------------
+// Every positional label in this sidecar is in WORLD units -- `x` runs across
+// a 1200-unit stage -- while a perception model sees SCREEN pixels. Soku's
+// camera pans with the players and zooms with their separation, so the map
+// between the two changes every frame and is not recoverable from the frame.
+//
+// That mismatch has now cost this project three separate results. A projectile
+// heatmap was asked to emit player-relative offsets from a screen-space
+// feature map and plateaued across a 862x range of head capacity; a coordinate
+// grid meant to fix it came out worse; and a character-identity head settled
+// its attention on fixed screen regions with a correlation of +0.0012 to where
+// the characters actually were. In each case the question was posed in a frame
+// the architecture could not represent, and the resulting null was read as a
+// fact about the data.
+//
+// Seven floats fix it for good. `leftEdge`..`bottomEdge` give the visible
+// world rectangle directly, so screen_x = (world_x - left) / (right - left),
+// and `translate`/`scale` are kept because they are what the game itself
+// applies and are the cross-check if the edges ever disagree.
+//
+// Layout from SokuLib's `Camera` struct at ADDR_CAMERA_OBJ = 0x00898600
+// (third_party/SokuLib/src/Camera.hpp), all offsets verified against that
+// header rather than guessed.
+struct CameraState {
+    float x       = 0.0f;   // translate.x   @ +0x0C
+    float y       = 0.0f;   // translate.y   @ +0x10
+    float scale   = 0.0f;   // scale         @ +0x14
+    float left    = 0.0f;   // leftEdge      @ +0x5C
+    float top     = 0.0f;   // topEdge       @ +0x60
+    float right   = 0.0f;   // rightEdge     @ +0x64
+    float bottom  = 0.0f;   // bottomEdge    @ +0x68
+};
+
+// Null-safe: outside a battle the object is not meaningful and every field
+// comes back zero, which a reader can test for with right <= left rather than
+// having to know a sentinel.
+CameraState readCamera();
+
 PlayerState readPlayerState(void* char_obj);
 
 // Fills `out`'s projectile fields by walking `char_obj`'s object list, keeping
