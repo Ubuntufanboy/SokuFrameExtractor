@@ -60,8 +60,19 @@ SQUARE = 480
 # which bounds the file for any duration.
 #
 # The cap is set below the budget, not at it, so the container overhead and
-# the mp4 index still fit underneath. It only engages during the busiest
-# scenes; typical footage lands well under it.
+# the mp4 index still fit underneath.
+#
+# MEASURED 2026-09-09, AND NOT WHAT THIS COMMENT USED TO CLAIM. It said the cap
+# "only engages during the busiest scenes; typical footage lands well under
+# it". Over 20 corpus videos the median bitrate is 1.468 Mbit/s against a
+# 1.500 cap and 17 of 20 sit at or above 95% of it, so the cap BINDS almost
+# everywhere and it -- not `crf` -- is what actually sets corpus quality. The
+# 625 MB/h figure in the table below came from one 302 s capture that was
+# easier to encode than the corpus turned out to be.
+#
+# That matters beyond bookkeeping: the live path (`sokubot/live/capture.py`)
+# reproduces every step of this chain except the encode, so the model trains on
+# bitrate-starved frames and infers on unquantised full-chroma ones.
 #
 # Measured on a real 302 s capture, squashed to 480x480:
 #
@@ -110,8 +121,18 @@ def build_command(
     square: int = SQUARE,
     threads: int = 4,
     vaapi_device: str = "/dev/dri/renderD128",
+    lossless: bool = False,
 ) -> list[str]:
-    """FFmpeg argv for reading raw BGRA off `fifo` into a square `out_mp4`."""
+    """FFmpeg argv for reading raw BGRA off `fifo` into a square `out_mp4`.
+
+    `lossless` writes an RGB master with no quantisation and no chroma
+    subsampling, for measuring what the lossy default costs the encoder. It is
+    NOT a capture mode for corpus collection -- the files are roughly 30x
+    larger, which is the whole reason the default exists. Note that `--crf 0`
+    on the normal path is not a substitute: it keeps `-pix_fmt yuv420p`, so
+    chroma is halved before the quantiser ever sees it, and the VBV cap below
+    would clamp the bitrate anyway and quietly stop being lossless.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
         "-f", "rawvideo",
@@ -124,7 +145,20 @@ def build_command(
     # 4:3 -> 1:1 squash described at the top of this module.
     scale = f"scale={square}:{square}:flags=lanczos"
 
-    if vaapi:
+    if lossless:
+        # libx264rgb, not libx264: the ordinary encoder has no RGB pixel format
+        # and would convert to YUV, which is the exact loss being measured.
+        # No -maxrate/-bufsize -- a VBV cap and losslessness are contradictory,
+        # and the cap would win silently.
+        cmd += [
+            "-vf", f"vflip,{scale}",
+            "-c:v", "libx264rgb",
+            "-preset", "ultrafast",   # must still outrun capture
+            "-qp", "0",
+            "-threads", str(max(1, threads)),
+            "-pix_fmt", "rgb24",
+        ]
+    elif vaapi:
         cmd += [
             "-vaapi_device", vaapi_device,
             "-vf", f"vflip,{scale},format=nv12,hwupload",
@@ -203,6 +237,7 @@ class Encoder:
     out_mp4: Path
     vaapi: bool = False
     crf: int = DEFAULT_CRF
+    lossless: bool = False
     square: int = SQUARE
     log_path: Path | None = None
     n_cpus: int = 0
@@ -231,6 +266,7 @@ class Encoder:
         # pinned to the same block for consistency, though it costs nothing.
         cmd = (build_command(self.fifo, self.out_mp4, vaapi=self.vaapi,
                              crf=self.crf, square=self.square,
+                             lossless=self.lossless,
                              threads=self.n_cpus or 4)
                if self.video else build_null_command(self.fifo))
         argv = throttle.wrap(cmd, n_cpus=self.n_cpus)

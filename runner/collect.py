@@ -218,6 +218,7 @@ def capture_one(
     verbose: bool,
     video: bool = True,
     gzip_csv: bool = False,
+    lossless: bool = False,
 ) -> manifest.Entry:
     """Capture a single replay. Always returns an Entry; never raises for
     ordinary failures, because one bad replay must not end the run."""
@@ -273,6 +274,7 @@ def capture_one(
             log_path=out_dir / "ffmpeg.log",
             n_cpus=n_cpus,
             video=video,
+            lossless=lossless,
         ) as enc, wine.Xvfb() as xvfb:
             env = wine.wine_env(prefix, xvfb.display)
 
@@ -389,6 +391,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--square", type=int, default=encode.SQUARE,
                     help=f"output edge length; 4:3 is squashed to 1:1 "
                          f"(default {encode.SQUARE})")
+    ap.add_argument("--lossless", action="store_true",
+                    help="RGB master, no quantisation, no chroma "
+                         "subsampling; ~30x larger. For measuring "
+                         "what the lossy default costs, not for "
+                         "corpus collection.")
     ap.add_argument("--vaapi", action="store_true",
                     help="use GPU encoding if available")
     ap.add_argument("--no-video", action="store_true",
@@ -534,6 +541,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 video=not args.no_video,
                 gzip_csv=args.gzip_csv,
+                lossless=args.lossless,
             )
             manifest.append(args.out, entry)
 

@@ -45,6 +45,46 @@ SCREEN_W, SCREEN_H, SCREEN_DEPTH = 800, 600, 24
 # matters for teardown; see run_game().
 GAME_EXE = "th123e.exe"
 
+
+def wine_bin() -> str:
+    """Which wine to run. `$SFE_WINE`, else whatever is on PATH.
+
+    WHY THIS IS A KNOB AND NOT A CONSTANT
+    -------------------------------------
+    The extractor patches 32-bit code inline (a 5-byte JMP over wglSwapBuffers)
+    and overwrites a vtable, and both need a CLASSIC WoW64 Wine -- one with a
+    real `lib/wine/i386-unix`. Measured on the dev laptop 2026-09-09: under the
+    distro's wine-11.6, which is new-WoW64 only, the module loads and installs
+    both hooks successfully and the game then dies with C0000005 before
+    rendering a frame. The log is complete up to "Initialize() succeeded",
+    which is what makes it look like a working setup.
+
+    Check any candidate with:
+
+        ls -d "$(dirname $(dirname $SFE_WINE))"/lib/wine/i386-unix
+
+    A build without that directory will fail the same way, and the failure
+    arrives late enough to be mistaken for a bug in whatever you changed last.
+    """
+    import os
+    return os.environ.get("SFE_WINE", "wine")
+
+
+def wineserver_bin() -> str:
+    """The wineserver beside `wine_bin()`. Mixing versions does not work.
+
+    A wineserver from a different build refuses the prefix outright, which at
+    least fails loudly -- but only if they are actually paired, so this derives
+    one from the other instead of taking a second environment variable that
+    could disagree.
+    """
+    import os
+    w = os.environ.get("SFE_WINE")
+    if not w:
+        return "wineserver"
+    cand = Path(w).with_name("wineserver")
+    return str(cand) if cand.exists() else "wineserver"
+
 # Matches every Soku process regardless of which executable started it, so
 # teardown catches both th123e.exe and the th123.exe it runs as.
 _GAME_PROC_PATTERN = r"th123"
@@ -302,7 +342,7 @@ def run_game(
     # inside the same budget. Applying it later, to the game process, would be
     # too late -- llvmpipe has already sized its thread pool from the mask it
     # saw at startup.
-    argv = throttle.wrap(["wine", GAME_EXE], n_cpus=n_cpus)
+    argv = throttle.wrap([wine_bin(), GAME_EXE], n_cpus=n_cpus)
 
     log = open(log_path, "wb") if log_path else subprocess.DEVNULL
     try:
@@ -395,7 +435,7 @@ def kill_prefix(prefix: Path) -> None:
     env = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG="-all")
     try:
         subprocess.run(
-            ["wineserver", "-k"],
+            [wineserver_bin(), "-k"],
             env=env,
             timeout=20,
             stdout=subprocess.DEVNULL,
@@ -469,9 +509,22 @@ def clear_crash_sentinel(game_dir: Path) -> bool:
         try:
             data = json.loads(settings.read_text())
             modules = data.get("modules", {})
+            # MATCH THE DIRECTORY, NOT THE SUBSTRING.
+            #
+            # A sibling like `Modules\\SokuFrameExtractor.bak\\...` also
+            # contains "SokuFrameExtractor", and this loop used to switch it on
+            # too -- so every launch loaded TWO extractors that hooked each
+            # other. It silently confounded a hook test, and because the loop
+            # runs on every launch, hand-disabling the stray came undone on the
+            # next one. Enable exactly the canonical directory and switch any
+            # other variant off.
             for key, val in modules.items():
-                if "SokuFrameExtractor" in key and not val.get("enabled", False):
-                    val["enabled"] = True
+                parts = key.replace("/", "\\").split("\\")
+                if len(parts) < 2 or "sokuframeextractor" not in parts[-2].lower():
+                    continue
+                want = parts[-2] == "SokuFrameExtractor"
+                if bool(val.get("enabled", False)) != want:
+                    val["enabled"] = want
                     cleared = True
             if cleared:
                 settings.write_text(json.dumps(data, indent=1))
@@ -491,7 +544,7 @@ def wineserver_wait(prefix: Path, timeout_s: float = 30.0) -> None:
     env = dict(os.environ, WINEPREFIX=str(prefix), WINEDEBUG="-all")
     try:
         subprocess.run(
-            ["wineserver", "-w"],
+            [wineserver_bin(), "-w"],
             env=env,
             timeout=timeout_s,
             stdout=subprocess.DEVNULL,
