@@ -72,6 +72,27 @@ CHARACTER_NAMES = {
     19: "Suwako",
 }
 
+# Measured over 3010 corpus replays; see SokuReplayParser's docstring.
+P1_CHAR_OFF = 0x0E
+P2_CHAR_OFF = 0x3F
+DECK_SIZE = 20
+
+
+def _header_plausible(data: bytes) -> bool:
+    """Cheap shape check before any field is believed.
+
+    Both deck-count bytes are 20 on every replay in the corpus, and both
+    character bytes are in range. A file failing this is a different format,
+    not a corrupt one, and reading it would produce a confident wrong label.
+    """
+    if len(data) <= P2_CHAR_OFF + 2:
+        return False
+    return (data[P1_CHAR_OFF + 2] == DECK_SIZE
+            and data[P2_CHAR_OFF + 2] == DECK_SIZE
+            and data[P1_CHAR_OFF] < len(CHARACTER_NAMES)
+            and data[P2_CHAR_OFF] < len(CHARACTER_NAMES))
+
+
 STAGE_NAMES = {
     0: "Hakurei Shrine",
     1: "Forest of Magic",
@@ -172,20 +193,40 @@ class SokuReplayParser:
         [Uncompressed Header]  Variable length (~0x70-0x80 bytes)
         [Deflate Compressed]   Frame-by-frame input data
 
-    Header layout (approximate, based on community reverse-engineering):
-        0x00  (4 bytes)  : Version / signature dword
-        0x04  (2 bytes)  : Unknown
-        0x06  (1 byte)   : Unknown flags
-        0x07  (1 byte)   : Game mode / version sub-byte
-        0x08  (1 byte)   : P1 character ID
-        0x09  (1 byte)   : P1 palette
-        0x0A  (2 bytes)  : P1 deck profile / unknown
-        0x0C  (4 bytes)  : Unknown
-        0x10  (4 bytes)  : P1 card count (uint32 LE, typically 20)
-        0x14  (N*2 bytes): P1 deck cards (N uint16 LE values)
-        ...then P2 data in same structure...
+    Header layout, MEASURED over the 3010-replay corpus (2026-09-08):
+        0x00  (4 bytes)  : version dword, 0x000000D2 on every file seen
+        0x0E  (1 byte)   : P1 character ID   (0-19)
+        0x0F  (1 byte)   : P1 palette        (0-7)
+        0x10  (1 byte)   : P1 deck card count -- literally 20 on all 3010
+        0x3F  (1 byte)   : P2 character ID   (0-19)
+        0x40  (1 byte)   : P2 palette        (0-7)
+        0x41  (1 byte)   : P2 deck card count -- literally 20 on all 3010
         ...then stage, music, seed, padding...
         ...then deflate compressed input data begins
+
+    THE PREVIOUS OFFSETS WERE WRONG AND FAILED SILENTLY.
+    ----------------------------------------------------
+    This docstring used to say P1 character was at 0x08 and was labelled
+    "approximate, based on community reverse-engineering". Byte 0x08 is 6 on
+    every replay in the corpus, so every file that parsed at all reported the
+    same matchup -- 37 files, all "Remilia vs Reimu" -- and the rest were
+    rejected. A constant read as a label is the worst kind of wrong: it does
+    not raise, and a model trained on it learns that identity is not a function
+    of the pixels.
+
+    How the real offsets were found and checked, in case they ever need
+    redoing: histogram every byte of the first 0x60 across 3010 replays and
+    keep the offsets whose values span 0..19 with all twenty present. Exactly
+    two survive, 0x0E and 0x3F. Then confirm against something that cannot lie
+    -- decode a frame of the paired video and LOOK at it. 5315209 predicted
+    Tenshi vs Cirno and the frame shows Cirno; 5315260 predicted Yuyuko vs
+    Suwako and shows Yuyuko's pink hair against Suwako's blonde hat.
+
+    Corroborating structure: the byte after each character is a palette in
+    0..7, and the byte after that is a deck size of exactly 20 on both sides of
+    all 3010 files. `_header_plausible` uses those two constants as a shape
+    check, so a file with a different layout is REJECTED rather than read as
+    whatever happens to sit at the offset.
     """
 
     def __init__(self, file_path: str):
@@ -232,26 +273,35 @@ class SokuReplayParser:
             # Game version / signature (first 4 bytes, uint32 LE)
             self.metadata.game_version = struct.unpack_from("<I", data, 0)[0]
 
-            # Player 1 character ID at offset 0x08
-            self.metadata.p1.character_id = data[0x08]
+            if not _header_plausible(data):
+                self.metadata.parse_errors.append(
+                    "header does not match the measured v1.10a layout "
+                    "(deck counts at 0x10/0x41 are not both 20)")
+                return False
+
+            # Player 1 character ID at offset 0x0E -- see the class docstring
+            # for how this was measured and why 0x08 was wrong.
+            self.metadata.p1.character_id = data[P1_CHAR_OFF]
             self.metadata.p1.character_name = CHARACTER_NAMES.get(
                 self.metadata.p1.character_id, f"Unknown({self.metadata.p1.character_id})"
             )
-            self.metadata.p1.palette = data[0x09]
+            self.metadata.p1.palette = data[P1_CHAR_OFF + 1]
 
-            # P1 card count at offset 0x10 (uint32 LE)
-            p1_card_count = struct.unpack_from("<I", data, 0x10)[0]
-            if p1_card_count > 20:
-                # Sanity check: decks can't exceed 20 cards
+            # P1 card count is a BYTE at 0x10, not a dword. Read as a uint32
+            # it swallowed the first two deck cards, came out in the millions,
+            # and the "clamp to 20" below hid that -- the clamp is why this
+            # never surfaced as an error.
+            p1_card_count = data[P1_CHAR_OFF + 2]
+            if p1_card_count > DECK_SIZE:
                 logger.warning(
-                    "%s: P1 card count %d exceeds 20, clamping",
-                    self.file_path, p1_card_count,
+                    "%s: P1 card count %d exceeds %d, clamping",
+                    self.file_path, p1_card_count, DECK_SIZE,
                 )
-                p1_card_count = min(p1_card_count, 20)
+                p1_card_count = min(p1_card_count, DECK_SIZE)
             self.metadata.p1.card_count = p1_card_count
 
-            # P1 deck cards starting at offset 0x14
-            p1_deck_start = 0x14
+            # P1 deck cards follow the count byte.
+            p1_deck_start = P1_CHAR_OFF + 3
             p1_deck_end = p1_deck_start + p1_card_count * 2
             if p1_deck_end > len(data):
                 self.metadata.parse_errors.append("P1 deck extends beyond file")
@@ -262,8 +312,10 @@ class SokuReplayParser:
                 for i in range(p1_card_count)
             ]
 
-            # Player 2 data follows P1 deck
-            p2_header_start = p1_deck_end
+            # Player 2 sits at a FIXED offset, not wherever P1's deck happens
+            # to end. Chaining off the deck length is what made a single
+            # miscounted field corrupt the second player's character too.
+            p2_header_start = P2_CHAR_OFF
             if p2_header_start + 10 > len(data):
                 self.metadata.parse_errors.append("P2 header beyond file bounds")
                 return False
@@ -275,25 +327,20 @@ class SokuReplayParser:
             )
             self.metadata.p2.palette = data[p2_header_start + 1]
 
-            # P2 card count: scan for the uint32 that equals 20 (0x14)
-            # The P2 block mirrors P1 structure but the exact offsets
-            # depend on intervening unknown fields. We search forward
-            # for a plausible card count (0-20) encoded as uint32.
-            p2_card_count_offset = self._find_card_count(p2_header_start + 2, max_scan=12)
-            if p2_card_count_offset is None:
-                # Fallback: assume 5-byte gap like P1 (offset+5)
-                p2_card_count_offset = p2_header_start + 5
-                logger.debug(
-                    "%s: Could not find P2 card count, using fallback offset 0x%X",
-                    self.file_path, p2_card_count_offset,
-                )
-
-            p2_card_count = struct.unpack_from("<I", data, p2_card_count_offset)[0]
-            if p2_card_count > 20:
-                p2_card_count = min(p2_card_count, 20)
+            # P2's count byte sits exactly where P1's does relative to its own
+            # character, at 0x41. The old code SCANNED for a uint32 equal to 20
+            # and fell back to a guessed gap when it failed -- a search that
+            # finds "something that looks like 20" will always find one
+            # eventually, which is how a wrong offset became a confident value.
+            p2_card_count_offset = P2_CHAR_OFF + 2
+            p2_card_count = data[p2_card_count_offset]
+            if p2_card_count > DECK_SIZE:
+                p2_card_count = min(p2_card_count, DECK_SIZE)
             self.metadata.p2.card_count = p2_card_count
 
-            p2_deck_start = p2_card_count_offset + 4
+            # Mirrors P1: the deck starts immediately after the count
+            # byte (P1 is 0x10 -> 0x11), not four bytes later.
+            p2_deck_start = p2_card_count_offset + 1
             p2_deck_end = p2_deck_start + p2_card_count * 2
             if p2_deck_end > len(data):
                 self.metadata.parse_errors.append("P2 deck extends beyond file")
