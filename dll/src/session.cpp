@@ -296,6 +296,7 @@ static char s_replay_path[SFE_PATH_MAX] = {};
 static volatile LONG s_start_request = 0;  // 1: do the start on the next tick
 static volatile LONG s_start_done    = 0;  // 1: ok, -1: the game rejected the .rep
 static volatile LONG s_start_mode    = -1; // mainMode the game picked, for the log
+static volatile LONG s_start_submode = -1; // subMode actually passed, for the log
 
 // -------------------------------------------------------------------------
 // Finding the decoded replay input buffer
@@ -907,6 +908,7 @@ static int __fastcall HookedSceneProcess(void* This, void* edx) {
         reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(bmode, sub);
 
         InterlockedExchange(&s_start_mode, main_mode);
+        InterlockedExchange(&s_start_submode, sub);
         InterlockedExchange(&s_start_done, 1);
         return SCENE_LOADING;
     }
@@ -998,6 +1000,12 @@ static DWORD*           s_kmm_vtbl      = nullptr;
 static void*            s_kmm[2]        = { nullptr, nullptr };
 static unsigned short   s_kmm_word[2]   = { 0, 0 };
 static bool             s_kmm_drive[2]  = { false, false };
+
+// Counterfactual override, direction axis only. Declared beside the injection
+// state because `HookedKeymapPoll` below is what applies it; the logic that
+// sets it lives with the rest of the CF code further down.
+static int              s_cf_axis[2]    = { 0, 0 };
+static bool             s_cf_active[2]  = { false, false };
 static long             s_poll_calls    = 0;
 
 static void writeKeyInput(void* kmm, unsigned short word) {
@@ -1016,9 +1024,20 @@ static void writeKeyInput(void* kmm, unsigned short word) {
 static int __fastcall HookedKeymapPoll(void* This, void* edx) {
     const int r = s_orig_kmm_poll(This, edx);
     ++s_poll_calls;
-    for (int i = 0; i < 2; ++i)
-        if (This == s_kmm[i] && s_kmm_drive[i])
+    for (int i = 0; i < 2; ++i) {
+        if (This != s_kmm[i]) continue;
+        if (s_kmm_drive[i]) {
             writeKeyInput(This, s_kmm_word[i]);
+        } else if (s_cf_active[i]) {
+            // ONLY the horizontal axis. KeyInput was just refilled by the
+            // original poll -- under replay submode that is the recorded
+            // input -- so buttons and the vertical axis stay exactly as
+            // played and the stance is the single thing that differs.
+            auto* in = reinterpret_cast<volatile int*>(
+                reinterpret_cast<char*>(This) + KMM_INPUT_OFFSET);
+            in[0] = s_cf_axis[i];
+        }
+    }
     return r;
 }
 
@@ -1277,24 +1296,66 @@ static void cfInit() {
              s_cf.frame, s_cf.frame + s_cf.len - 1);
 }
 
-static void cfApply(long f, int toward1) {
-    if (!s_cf.armed) return;
-    if (f < s_cf.frame || f >= s_cf.frame + s_cf.len) return;
+// A counterfactual pair needs the two runs IDENTICAL outside the window, and
+// self-play cannot give that. Its mode schedule advances per hook call while
+// the window is keyed to the battle frame, and the battle frame freezes during
+// hitstop, so the two clocks slip against each other: measured at 6 disagreeing
+// frames out of 671 BEFORE the window, which is not a controlled comparison.
+//
+// A REPLAY is deterministic by construction -- both players' inputs come from
+// the recorded stream -- so running the pair in BATTLE_SUBMODE_REPLAY makes
+// everything before the window identical for free, and the intervention is the
+// only difference there is. That vehicle needs the override to work with NO
+// policy running, which is why the state below is separate from `s_kmm_word`
+// and why `cfDrive` is not gated on `s_selfplay`.
+
+// -> +1 to push RIGHT, -1 to push LEFT, for the configured player this frame.
+static int cfWant(void* bm) {
+    void* p1obj = *reinterpret_cast<void**>(
+        reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
+    void* p2obj = *reinterpret_cast<void**>(
+        reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
+    if (!p1obj || !p2obj) return 0;
+    const float x1 = sfe::readPlayerState(p1obj).x;
+    const float x2 = sfe::readPlayerState(p2obj).x;
+    const int toward1 = (x2 >= x1) ? 1 : -1;
     const int i = s_cf.player - 1;
     // `toward1` is p1's toward direction; p2's is its negation.
     const int toward = (i == 0) ? toward1 : -toward1;
-    const int want = (s_cf.dir > 0) ? -toward : toward;   // away flips it
-    unsigned short w = s_kmm_word[i];
-    w = static_cast<unsigned short>(w & ~(INPUT_LEFT | INPUT_RIGHT));
-    w = static_cast<unsigned short>(w | (want > 0 ? INPUT_RIGHT : INPUT_LEFT));
-    s_kmm_word[i] = w;
+    return (s_cf.dir > 0) ? -toward : toward;             // away flips it
+}
+
+// Once per tick, AFTER policyDrive so the self-play word is already chosen.
+static void cfDrive(void* bm, long frame) {
+    cfInit();
+    s_cf_active[0] = s_cf_active[1] = false;
+    if (!s_cf.armed || !bm) return;
+    if (frame < s_cf.frame || frame >= s_cf.frame + s_cf.len) return;
+    const int want = cfWant(bm);
+    if (!want) return;
+    const int i = s_cf.player - 1;
+    if (s_selfplay) {
+        // Self-play owns the whole input word, so fold the override into it and
+        // let writeKeyInput carry it through, exactly as before.
+        unsigned short w = s_kmm_word[i];
+        w = static_cast<unsigned short>(w & ~(INPUT_LEFT | INPUT_RIGHT));
+        w = static_cast<unsigned short>(w | (want > 0 ? INPUT_RIGHT : INPUT_LEFT));
+        s_kmm_word[i] = w;
+        return;
+    }
+    // No policy: the original poll has filled KeyInput from the replay stream,
+    // and the hook rewrites ONLY the horizontal axis on top of it. Every other
+    // axis and button stays whatever was recorded, which is what makes this the
+    // same intervention `state_action_effect` asks the model about.
+    s_cf_active[i] = true;
+    s_cf_axis[i]   = want;
 }
 
 // Both players, once per tick, from the pre-tick hook -- ahead of the poll that
 // the injection hook rides on.
 static void policyDrive(void* bm, long frame) {
+    (void)frame;
     if (!s_selfplay || !bm) return;
-    cfInit();
     // NOT keyed to battle_frame. That was tried, on the theory that a tick the
     // hook saw twice would advance the schedule twice: it made two runs of the
     // same seed disagree on 602 of 656 pre-window frames instead of 6, because
@@ -1314,7 +1375,6 @@ static void policyDrive(void* bm, long frame) {
     s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d,
                                 PM_MAX[s_pol[1].mode] - s_pol[1].left);
     s_kmm_drive[0] = s_kmm_drive[1] = true;
-    cfApply(frame, x2 >= x1 ? 1 : -1);
 }
 
 static void policyInit() {
@@ -1735,8 +1795,14 @@ static int __fastcall HookedBattleUpdate(void* This, void* edx) {
     // the two characters come from the manager the same way the capture reads
     // them -- which also keeps the two paths reading one source of truth.
     void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
-    policyDrive(bm, bm ? static_cast<long>(*reinterpret_cast<volatile uint32_t*>(
-        reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET)) : 0);
+    const long bm_frame = bm ? static_cast<long>(
+        *reinterpret_cast<volatile uint32_t*>(
+            reinterpret_cast<char*>(bm) + BM_FRAME_COUNT_OFFSET)) : 0;
+    policyDrive(bm, bm_frame);
+    // After policyDrive, so a self-play run folds the override into the word it
+    // just chose. Called unconditionally: the deterministic vehicle for a
+    // counterfactual pair is a replay, where no policy runs at all.
+    cfDrive(bm, bm_frame);
     sweepStep();
     if (bm) {
         watchArm(*reinterpret_cast<void**>(
@@ -2170,9 +2236,15 @@ FrameTag Session::onFrame() {
 
         const LONG done = InterlockedCompareExchange(&s_start_done, 0, 0);
         if (done == 1) {
+            // Report the submode ACTUALLY used, not the default. This line
+            // used to hardcode BATTLE_SUBMODE_REPLAY in the format arguments,
+            // so a run started with SFE_BATTLE_SUBMODE=0 still logged
+            // "setBattleMode(3, 2)" -- which reads as the env var having been
+            // ignored, and cost an hour of chasing a bug that was in the log
+            // string rather than in the behaviour.
             sfe::log("readReplay accepted the file; setBattleMode(%ld, %d) done "
                      "— scene requested", InterlockedCompareExchange(&s_start_mode, 0, 0),
-                     BATTLE_SUBMODE_REPLAY);
+                     InterlockedCompareExchange(&s_start_submode, 0, 0));
             transitionTo(AutoState::START_REPLAY);
         } else if (done == -1) {
             // The game read the header and refused it.  This is a property of
@@ -2327,6 +2399,7 @@ FrameTag Session::onFrame() {
         tag.p2_input    = p2;
         tag.p1_state    = p1s;
         tag.p2_state    = p2s;
+        tag.camera      = sfe::readCamera();
         ++m_frame_index;
 
         // --- throughput logging ---
