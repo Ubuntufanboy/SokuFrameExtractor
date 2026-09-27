@@ -59,9 +59,22 @@ def cgroup_cpu_quota() -> float | None:
     return None
 
 
+def allowed_cpus() -> list[int]:
+    """The core ids this process may run on, ascending.
+
+    NOT range(os.cpu_count()). A Slurm job is confined to a cpuset -- on Amarel a 16-core job on a
+    64-core node may own cores 17-32 and nothing else -- and `taskset -c` naming a core outside the
+    cpuset fails the launch outright. On a workstation this is every core, so nothing changes there.
+    """
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return list(range(os.cpu_count() or 2))
+
+
 def available_cpus() -> int:
-    """Cores we can really use: the smaller of the host count and the quota."""
-    total = os.cpu_count() or 2
+    """Cores we can really use: the smaller of the allowed count and the quota."""
+    total = len(allowed_cpus())
     quota = cgroup_cpu_quota()
     if quota is not None:
         total = max(1, min(total, int(quota)))
@@ -107,12 +120,14 @@ def cpu_list(n_cpus: int, block: int | None = None) -> str:
     Blocks wrap if more are requested than fit, which oversubscribes rather
     than failing: a slow run beats a run that will not start.
     """
-    total = available_cpus()
+    cores = allowed_cpus()
+    total = min(len(cores), available_cpus())
+    cores = cores[len(cores) - total:]          # the highest-numbered of the allowed cores
     n = max(1, min(n_cpus, total))
     if block is None:
         block = cpu_block()
     start = total - n * (block + 1)
-    return ",".join(str((start + k) % total) for k in range(n))
+    return ",".join(str(cores[(start + k) % total]) for k in range(n))
 
 
 def wrap(argv: list[str], *, n_cpus: int, nice: int = DEFAULT_NICE) -> list[str]:

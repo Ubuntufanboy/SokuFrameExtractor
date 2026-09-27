@@ -27,6 +27,15 @@ REP_SRC="${3:-}"
 SSH_KEY="${SFE_SSH_KEY:-$HOME/.ssh/id_ed25519_ai}"
 SSH="ssh -i $SSH_KEY"
 
+# Compress the streams when both ends have zstd (SFE_COMPRESS=0 to turn it off). The .dat archives
+# shrink to ~35-45%, which is most of the 2.1 GB: over a 2 MB/s VPN tunnel (the Amarel path) that is
+# ~7 minutes instead of ~17. On a LAN it costs little either way.
+ZC=cat; ZD=cat
+if [ "${SFE_COMPRESS:-1}" = "1" ] && command -v zstd >/dev/null \
+   && $SSH "$TARGET" "command -v zstd" >/dev/null 2>&1; then
+    ZC="zstd -3 -T2 -q -c"; ZD="zstd -d -q -c"
+fi
+
 cd "$(dirname "$0")/../.."
 REPO="$PWD"
 
@@ -37,7 +46,7 @@ echo "==> game -> $TARGET:~/sfe-game"
 tar -C "$GAME_SRC" -cf - \
     --exclude=soku_extract --exclude=crashes --exclude='modules/*' \
     . \
-  | $SSH "$TARGET" "mkdir -p ~/sfe-game && tar -x -C ~/sfe-game"
+  | $ZC | $SSH "$TARGET" "mkdir -p ~/sfe-game && $ZD | tar -x -C ~/sfe-game"
 
 echo "==> module + ini"
 tar -C "$REPO" -cf - \
@@ -60,7 +69,7 @@ tar -C "$REPO" -cf - --exclude='__pycache__' \
 if [ -n "$REP_SRC" ]; then
     echo "==> replays -> $TARGET:~/sfe-replays"
     tar -C "$REP_SRC" -cf - . \
-      | $SSH "$TARGET" "mkdir -p ~/sfe-replays && tar -x -C ~/sfe-replays"
+      | $ZC | $SSH "$TARGET" "mkdir -p ~/sfe-replays && $ZD | tar -x -C ~/sfe-replays"
 fi
 
 $SSH "$TARGET" "du -sh ~/sfe-game ~/sfe ~/sfe-replays 2>/dev/null; \
