@@ -19,6 +19,7 @@
 #   cd ~/sokubot-runs && sbatch --array=0-15 ~/sfe/ops/bwrap/amarel-statecap.slurm
 #   WORKERS=2 LIMIT=1 sbatch --array=0-0 ...            # a quick trial: one replay per worker
 #   TASKS=16 sbatch --array=6-15 ...                    # redo SOME tasks of a 16-task layout
+#   SHARD_BASE=64 REPLAY_DIR=~/sfe-replays-rest TASKS=32 sbatch --array=0-31 ...   # a second layout
 #
 # THE SLICE A WORKER GETS IS A PURE FUNCTION OF (task, worker, array size, WORKERS): shard
 # k = task*WORKERS + w of N = tasks*WORKERS, over the sorted replay list (runner/collect.py strides
@@ -53,31 +54,38 @@ LOCAL=${TMPDIR:-/tmp}/sfe-statecap-${SLURM_JOB_ID:-$$}
 # SFE_GAMES lets a trial run use its own clones: two jobs sharing a clone overwrite each other's
 # per-job .ini, and a trial alongside a running array would corrupt the array's captures.
 GAMES=${SFE_GAMES:-$HOME/sfe-work/games}
+# A SECOND layout over a different replay set (e.g. what an earlier layout did not capture) must not
+# reuse the first layout's shard names: its w<k> would hold another slice's manifest, and --resume would
+# skip nothing it should. SHARD_BASE offsets the NAMES (w<base+k>, game clones, logs) while --shard k/N
+# still slices REPLAY_DIR. Default: the one layout, over every replay.
+BASE=${SHARD_BASE:-0}
+REPLAYS=${REPLAY_DIR:-$HOME/sfe-replays}
 LIMIT_ARG=(); [ -n "${LIMIT:-}" ] && LIMIT_ARG=(--limit "$LIMIT")
 mkdir -p "$OUTROOT/logs" "$LOCAL" "$GAMES"
 trap 'rm -rf "$LOCAL"' EXIT
 
-echo "== $(date -Is) task $t/$T restart ${SLURM_RESTART_COUNT:-0} on $(hostname): $W workers x $CPUS cpus, shards of $N"
+echo "== $(date -Is) task $t/$T restart ${SLURM_RESTART_COUNT:-0} on $(hostname): $W workers x $CPUS cpus, shards of $N named from w$BASE, replays from $REPLAYS"
 echo "== cpus allowed: $(python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))')"
 pids=()
 for w in $(seq 0 $((W - 1))); do
     k=$(( t * W + w ))
-    g=$GAMES/k$k
+    K=$(( BASE + k ))
+    g=$GAMES/k$K
     "$HOME/sfe/ops/bwrap/clone-game.sh" "$HOME/sfe-game" "$g" >/dev/null
-    SFE_GAME=$g SFE_PREFIX=$LOCAL/prefix$w SFE_OUT=$OUTROOT/w$k \
-    SFE_REPLAYS=$HOME/sfe-replays SFE_CPU_BLOCK=$w \
+    SFE_GAME=$g SFE_PREFIX=$LOCAL/prefix$w SFE_OUT=$OUTROOT/w$K \
+    SFE_REPLAYS=$REPLAYS SFE_CPU_BLOCK=$w \
         "$HOME/sfe/ops/bwrap/sfe-bwrap" /app/docker/entrypoint.sh \
             --replay-dir /replays --out /out --shard "$k/$N" --no-video --gzip-csv --resume \
             --cpus "$CPUS" --timeout 900 --min-free-gb 20 "${LIMIT_ARG[@]}" \
-        >> "$OUTROOT/logs/w$k.log" 2>&1 &
+        >> "$OUTROOT/logs/w$K.log" 2>&1 &
     pids+=($!)
 done
 rc=0
 for p in "${pids[@]}"; do wait "$p" || rc=$?; done
 echo "== $(date -Is) task $t done, last nonzero worker exit: $rc"
 for w in $(seq 0 $((W - 1))); do
-    k=$(( t * W + w ))
-    m=$OUTROOT/w$k/manifest.jsonl
-    [ -f "$m" ] && echo "   shard $k: $(grep -c '"ok"' "$m" 2>/dev/null || echo 0) manifest lines mentioning ok, $(wc -l < "$m") total"
+    K=$(( BASE + t * W + w ))
+    m=$OUTROOT/w$K/manifest.jsonl
+    [ -f "$m" ] && echo "   shard $K: $(grep -c '"ok"' "$m" 2>/dev/null || echo 0) manifest lines mentioning ok, $(wc -l < "$m") total"
 done
 exit "$rc"
