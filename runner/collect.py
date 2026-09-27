@@ -202,6 +202,19 @@ def write_ini(
     )
 
 
+def exited_before_module_ran(entry) -> bool:
+    """The game quit on its own before the module did anything: no status.json, zero frames.
+
+    Measured on Amarel, 2026-09-26: this is a FIRST-launch-in-a-fresh-prefix failure. 17 of 64 workers'
+    first captures and 2 of 4 in a reproduction ended this way; the module's own log shows
+    "Initialize() succeeded" then DLL_PROCESS_DETACH in the same second, and every later launch in the
+    same prefix worked. Root cause not found. A failure this early says nothing about the replay, so
+    it is retried once rather than left for the next --resume pass.
+    """
+    return (entry.status == "failed" and entry.frames == 0
+            and str(entry.reason or "").startswith("no status.json (game exited"))
+
+
 def capture_one(
     rep: Path,
     *,
@@ -334,6 +347,13 @@ def capture_one(
                 entry.reason = (f"drained {drained} frames off the FIFO but the "
                                 f"DLL reported {entry.frames}")
 
+    except wine.WineError as e:
+        # One replay's environment failing to come up (seen on Amarel: "Xvfb :90 did not come up
+        # within 5s" on a loaded node) used to escape and kill the whole worker, abandoning the rest
+        # of its shard. It is a failure of THIS attempt, recorded and retried by the next --resume.
+        entry.status = "failed"
+        entry.reason = f"wine: {e}"
+        entry.elapsed_ms = int((time.monotonic() - t0) * 1000)
     finally:
         # Always tear the prefix down, even on an exception: a surviving game
         # process holds the FIFO open and wedges the *next* replay.
@@ -526,8 +546,7 @@ def main(argv: list[str] | None = None) -> int:
                           f"{args.max_output_gb:.1f} GB allowed")
                     break
 
-            entry = capture_one(
-                rep,
+            kw = dict(
                 prefix=args.prefix,
                 game_dir=game_dir,
                 module_dir=module_dir,
@@ -543,6 +562,13 @@ def main(argv: list[str] | None = None) -> int:
                 gzip_csv=args.gzip_csv,
                 lossless=args.lossless,
             )
+            entry = capture_one(rep, **kw)
+            if exited_before_module_ran(entry):
+                # Kept in the manifest for provenance; --resume counts only "ok" entries.
+                manifest.append(args.out, entry)
+                print(f"  {entry.reason} before the module ran -- retrying once", flush=True)
+                entry = capture_one(rep, **kw)
+                entry.meta["retry_after_early_exit"] = True
             manifest.append(args.out, entry)
 
             if entry.status == "ok":
