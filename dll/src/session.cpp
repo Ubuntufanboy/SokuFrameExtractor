@@ -846,7 +846,95 @@ static void dumpInputManager() {
 }
 
 // The hook.  Runs on the game's main thread from 0x00407F43.
+// -------------------------------------------------------------------------
+// vs COM: a real match against the game's own AI, started with no menus
+// -------------------------------------------------------------------------
+// SFE_VSCOM=1 replaces the replay start. Read off th123.exe (2026-09-30):
+//
+//   setBattleMode (0x43E9A0) resets the setup struct at 0x899D08 -- left
+//     character := 0 (Reimu), right := 0xF (Sanae), palettes and deck slots := 0
+//     -- and copies config+0x64 (0x8998A4) into setup+0. That reset is why every
+//     menu-free versus start so far played Reimu whatever the replay said.
+//   prepareBattle (0x43EEF0) builds both effective decks per battle mode (its
+//     VSCOM case: the left deck from profile1's slot via 0x4356A0, the CPU's
+//     with 0x4356F0) and copies config+0x64 into setup+0 again. Only the
+//     character-select scene calls it, so a menu-free start must call it itself,
+//     after setBattleMode and after the characters are written.
+//
+// setup+0 is the COM difficulty: HYPOTHESIS from the code paths that write it
+// (the select scene and the time-trial launcher), not yet confirmed in play.
+// Measure Easy against Lunatic before trusting it.
+//
+// Only P1 is ours. P2 is the AI, and wiring or driving its key manager would
+// replace the AI's input with ours -- see installPollHook.
+constexpr DWORD ADDR_PREPARE_BATTLE   = 0x0043EEF0;   // __cdecl(int), callers push 0
+constexpr DWORD ADDR_CONFIG_COM_LEVEL = 0x008998A4;   // config (0x899840) + 0x64
+constexpr DWORD ADDR_BATTLE_SETUP     = 0x00899D08;   // setup+0: COM level
+constexpr DWORD ADDR_SETUP_LEFT       = ADDR_BATTLE_SETUP + 0x08;   // PlayerInfo
+constexpr DWORD ADDR_SETUP_RIGHT      = ADDR_BATTLE_SETUP + 0x28;
+constexpr int   PI_PALETTE   = 0x05;                  // PlayerInfo: u32 character,
+constexpr int   PI_DECK_SLOT = 0x07;                  //   u8 isRight, u8 palette, u8, u8 deck,
+constexpr int   PI_DECK_SIZE = 0x08 + 0x10;           //   deque at +8 (size at deque+0x10)
+constexpr int   CHAR_ID_OFFSET = 0x34C;               // live character object's id (u32)
+constexpr int   CHARACTER_CIRNO = 16;
+using PFN_prepareBattle = void (__cdecl*)(int);
+
+static bool s_vscom = false;
+
+static bool vscomRequested() {
+    const char* v = getenv("SFE_VSCOM");
+    return v && *v && *v != '0';
+}
+
+static int envInt(const char* name, int dflt, int lo, int hi) {
+    const char* v = getenv(name);
+    if (!v || !*v) return dflt;
+    const long x = strtol(v, nullptr, 10);
+    return x < lo ? lo : x > hi ? hi : static_cast<int>(x);
+}
+
+static void writeSetupPlayer(DWORD info, int character, int palette, int deck) {
+    *reinterpret_cast<volatile uint32_t*>(info) = static_cast<uint32_t>(character);
+    *reinterpret_cast<volatile uint8_t*>(info + PI_PALETTE)   = static_cast<uint8_t>(palette);
+    *reinterpret_cast<volatile uint8_t*>(info + PI_DECK_SLOT) = static_cast<uint8_t>(deck);
+}
+
+static void vscomStart() {
+    s_vscom = true;
+    guardInputDeviceSelector();
+    // Before setBattleMode: it copies config+0x64 into the setup, and so does
+    // prepareBattle. Writing setup+0 directly would be overwritten twice.
+    const int level = envInt("SFE_COM_LEVEL", 3, 0, 3);
+    *reinterpret_cast<volatile int32_t*>(ADDR_CONFIG_COM_LEVEL) = level;
+    reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(2 /*VSCOM*/, 0 /*PLAYING1*/);
+    const int c1 = envInt("SFE_P1_CHAR", CHARACTER_CIRNO, 0, 19);
+    const int c2 = envInt("SFE_P2_CHAR", CHARACTER_CIRNO, 0, 19);
+    // A mirror match needs a second palette or the two are indistinguishable on
+    // screen -- irrelevant to the state, not to anyone watching the video.
+    writeSetupPlayer(ADDR_SETUP_LEFT,  c1, envInt("SFE_P1_PAL", 0, 0, 7),
+                     envInt("SFE_P1_DECK", 0, 0, 3));
+    writeSetupPlayer(ADDR_SETUP_RIGHT, c2, envInt("SFE_P2_PAL", c1 == c2 ? 1 : 0, 0, 7),
+                     envInt("SFE_P2_DECK", 0, 0, 3));
+    reinterpret_cast<PFN_prepareBattle>(ADDR_PREPARE_BATTLE)(0);
+    sfe::log("vscom: start p1 char %u deck %u (%u cards) vs COM char %u (%u cards), "
+             "COM level setup=%d config=%d",
+             *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT),
+             *reinterpret_cast<volatile uint8_t*>(ADDR_SETUP_LEFT + PI_DECK_SLOT),
+             *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT + PI_DECK_SIZE),
+             *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_RIGHT),
+             *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_RIGHT + PI_DECK_SIZE),
+             *reinterpret_cast<volatile int32_t*>(ADDR_BATTLE_SETUP),
+             *reinterpret_cast<volatile int32_t*>(ADDR_CONFIG_COM_LEVEL));
+}
+
 static int __fastcall HookedSceneProcess(void* This, void* edx) {
+    if (vscomRequested() && InterlockedCompareExchange(&s_start_request, 0, 1) == 1) {
+        vscomStart();
+        InterlockedExchange(&s_start_mode, 2);
+        InterlockedExchange(&s_start_submode, 0);
+        InterlockedExchange(&s_start_done, 1);
+        return SCENE_LOADING;
+    }
     if (InterlockedCompareExchange(&s_start_request, 0, 1) == 1) {
         auto readReplay = reinterpret_cast<PFN_readReplay>(ADDR_READ_REPLAY);
         void* mgr = reinterpret_cast<void*>(ADDR_INPUT_MANAGER);
@@ -1374,7 +1462,8 @@ static void policyDrive(void* bm, long frame) {
                                 PM_MAX[s_pol[0].mode] - s_pol[0].left);
     s_kmm_word[1]  = policyWord(1, x1 >= x2 ?  1 : -1, d,
                                 PM_MAX[s_pol[1].mode] - s_pol[1].left);
-    s_kmm_drive[0] = s_kmm_drive[1] = true;
+    s_kmm_drive[0] = true;
+    s_kmm_drive[1] = !s_vscom;   // never the COM AI's chair
 }
 
 static void policyInit() {
@@ -1413,17 +1502,21 @@ static void policyInit() {
 }
 
 static bool installPollHook(void* p1obj, void* p2obj) {
+    // vs COM: P2 is the game's AI. Never wire its key manager (that would hand
+    // its input to an inert static manager) and never record it as ours, so the
+    // poll hook below cannot touch it even when both managers share a vtable.
+    if (s_vscom) p2obj = nullptr;
     wireKeyManagers(p1obj, p2obj);
     s_kmm[0] = keymapManagerOf(p1obj);
     s_kmm[1] = keymapManagerOf(p2obj);
-    if (!s_kmm[0] || !s_kmm[1]) {
+    if (!s_kmm[0] || (!s_vscom && !s_kmm[1])) {
         sfe::log("pollHook: no KeymapManager (p1=%p p2=%p) -- char+0x750 is "
                  "null, so 0x0046C8E0 skips the copy entirely and this player "
                  "is not driven from a manager at all", s_kmm[0], s_kmm[1]);
         return false;
     }
     DWORD* v1 = *reinterpret_cast<DWORD**>(s_kmm[0]);
-    DWORD* v2 = *reinterpret_cast<DWORD**>(s_kmm[1]);
+    DWORD* v2 = s_kmm[1] ? *reinterpret_cast<DWORD**>(s_kmm[1]) : v1;
     if (v1 != v2)
         sfe::log("pollHook: WARNING p1 and p2 managers have different vtables "
                  "(%p vs %p); only p1's is patched", v1, v2);
@@ -2160,6 +2253,79 @@ void Session::shutdown() {
 // -------------------------------------------------------------------------
 // onFrame — the single per-frame entry point (game thread)
 // -------------------------------------------------------------------------
+// vs COM diagnostics. Everything the start path WROTE is reported back from
+// the live objects, not from the setup struct it wrote into: a label that
+// echoes its own input is how a whole self-play corpus came out as one matchup.
+// BattleManager fields per SokuLib: +0x84 leaveCode (1 select, 2 title),
+// +0x88 matchState, +0x904 currentRound; character +0x573 score (rounds won).
+constexpr int BM_LEAVE_CODE_OFFSET  = 0x084;
+constexpr int BM_MATCH_STATE_OFFSET = 0x088;
+constexpr int BM_ROUND_OFFSET       = 0x904;
+constexpr int CHAR_SCORE_OFFSET     = 0x573;
+
+static long     s_vs_frames      = 0;
+static long     s_vs_p2_nonzero  = 0;
+static long     s_vs_p2_distinct = 0;
+static uint32_t s_vs_p2_seen[65536 / 32] = {};
+static int      s_vs_last_state  = -1;
+static DWORD    s_vs_left_ms     = 0;   // when the scene left battle; 0 while in it
+static int      s_vs_last_scene  = -1;
+
+template <typename T>
+static T fieldAt(void* base, int off) {
+    return *reinterpret_cast<volatile T*>(reinterpret_cast<char*>(base) + off);
+}
+
+static void vscomObserve(void* bm, void* p1obj, void* p2obj, uint16_t p2in,
+                         const sfe::PlayerState& a, const sfe::PlayerState& b,
+                         uint32_t battle_frame) {
+    if (!s_vscom || !bm || !p1obj || !p2obj) return;
+    if (s_vs_left_ms) {
+        sfe::log("vscom: back in battle %u ms after leaving it", GetTickCount() - s_vs_left_ms);
+        s_vs_left_ms = 0;
+    }
+    if (p2in) ++s_vs_p2_nonzero;
+    uint32_t& w = s_vs_p2_seen[p2in >> 5];
+    if (!(w & (1u << (p2in & 31)))) { w |= 1u << (p2in & 31); ++s_vs_p2_distinct; }
+    const int state = fieldAt<int32_t>(bm, BM_MATCH_STATE_OFFSET);
+    const bool changed = state != s_vs_last_state;
+    if (changed || s_vs_frames % 600 == 0) {
+        sfe::log("vscom: frame %ld battle_frame %u matchState %d%s round %d leave %d | "
+                 "live chars p1 %u p2 %u | hp %d/%d score %d-%d | p2 input nonzero "
+                 "%ld of %ld, %ld distinct | pretick calls %ld",
+                 s_vs_frames, battle_frame, state, changed ? " (changed)" : "",
+                 static_cast<int>(fieldAt<int8_t>(bm, BM_ROUND_OFFSET)),
+                 fieldAt<int32_t>(bm, BM_LEAVE_CODE_OFFSET),
+                 fieldAt<uint32_t>(p1obj, CHAR_ID_OFFSET),
+                 fieldAt<uint32_t>(p2obj, CHAR_ID_OFFSET),
+                 static_cast<int>(a.hp), static_cast<int>(b.hp),
+                 static_cast<int>(fieldAt<int8_t>(p1obj, CHAR_SCORE_OFFSET)),
+                 static_cast<int>(fieldAt<int8_t>(p2obj, CHAR_SCORE_OFFSET)),
+                 s_vs_p2_nonzero, s_vs_frames + 1, s_vs_p2_distinct, s_bm_calls);
+        s_vs_last_state = state;
+    }
+    ++s_vs_frames;
+}
+
+// After a vs COM match the capture keeps watching for 15 s instead of draining
+// at once, logging every scene the game passes through: which scene follows a
+// match is what the restart loop has to hook, and nothing has measured it yet.
+// Returns true while still watching.
+static bool vscomWatchAfterBattle(int frame_index) {
+    const int sc = currentScene();
+    if (!s_vs_left_ms) {
+        s_vs_left_ms = GetTickCount();
+        if (!s_vs_left_ms) s_vs_left_ms = 1;
+        sfe::log("vscom: scene left battle at capture frame %d -> scene %d", frame_index, sc);
+        s_vs_last_scene = sc;
+    } else if (sc != s_vs_last_scene) {
+        sfe::log("vscom: scene %d -> %d at +%u ms", s_vs_last_scene, sc,
+                 GetTickCount() - s_vs_left_ms);
+        s_vs_last_scene = sc;
+    }
+    return GetTickCount() - s_vs_left_ms < 15000;
+}
+
 FrameTag Session::onFrame() {
     FrameTag tag{ false, 0, 0, 0 };
 
@@ -2312,6 +2478,7 @@ FrameTag Session::onFrame() {
     // ------------------------------------------------------------------
     case AutoState::EXTRACTING: {
         if (currentScene() != SCENE_BATTLE) {
+            if (s_vscom && vscomWatchAfterBattle(m_frame_index)) break;
             sfe::log("Scene left battle at frame %d", m_frame_index);
             finish(AutoState::DRAINING, nullptr);
             break;
@@ -2377,6 +2544,7 @@ FrameTag Session::onFrame() {
             // Where does this tick's word live? Answered from the same two
             // objects, on frames the game is already being read on.
             mirrorScan(p1, p2, p1obj, p2obj);
+            vscomObserve(bm, p1obj, p2obj, p2, p1s, p2s, battle_frame);
             sweepObserve(s_sweep_player == 2 ? p2 : p1);
         }
 
@@ -2408,10 +2576,21 @@ FrameTag Session::onFrame() {
             const uint32_t now_ms = GetTickCount();
             const uint32_t dt     = now_ms - m_last_log_tick;
             if (dt >= 5000) {
-                sfe::log("Perf: %.1f fps, ring %d/%d, encoder wrote %d",
+                // Pre-tick calls are game ticks; presented frames and the
+                // battle frame counter are not (it freezes during hitstop).
+                // All three per second, so "every 5 ticks" means something.
+                static long     s_perf_bm = 0;
+                static uint32_t s_perf_bf = 0;
+                sfe::log("Perf: %.1f fps, %.1f ticks/s, battle_frame %+.1f/s, ring %d/%d, "
+                         "encoder wrote %d",
                          m_frames_since_log * 1000.0f / static_cast<float>(dt),
+                         (s_bm_calls - s_perf_bm) * 1000.0f / static_cast<float>(dt),
+                         (static_cast<float>(battle_frame) - static_cast<float>(s_perf_bf))
+                             * 1000.0f / static_cast<float>(dt),
                          m_encoder->ring().pendingCount(), RING_CAPACITY,
                          m_encoder->totalFramesWritten());
+                s_perf_bm = s_bm_calls;
+                s_perf_bf = battle_frame;
                 m_frames_since_log = 0;
                 m_last_log_tick    = now_ms;
             }
