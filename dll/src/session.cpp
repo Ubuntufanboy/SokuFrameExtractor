@@ -906,6 +906,22 @@ static void writeSetupPlayer(DWORD info, int character, int palette, int deck) {
     *reinterpret_cast<volatile uint8_t*>(info + PI_DECK_SLOT) = static_cast<uint8_t>(deck);
 }
 
+// The COM's character for this match. SFE_P2_CHAR=-1 draws one of the 20 per
+// match -- the user's guard against a policy that learns one opponent's habits
+// instead of the game -- from its own xorshift, seeded by SFE_SEED so each game
+// in a run has a different, reproducible schedule.
+static int vscomOpponent() {
+    const int fixed = envInt("SFE_P2_CHAR", CHARACTER_CIRNO, -1, 19);
+    if (fixed >= 0) return fixed;
+    static uint32_t rng = 0;
+    if (!rng) {
+        rng = static_cast<uint32_t>(envInt("SFE_SEED", 1, 0, 1 << 30)) * 2654435761u + 0x9E3779B9u;
+        if (!rng) rng = 1;
+    }
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return static_cast<int>(rng % 20);
+}
+
 static void vscomStart() {
     s_vscom = true;
     s_vscom_matches_max = envInt("SFE_VSCOM_MATCHES", 0, 0, 1 << 30);
@@ -917,7 +933,7 @@ static void vscomStart() {
     *reinterpret_cast<volatile int32_t*>(ADDR_CONFIG_COM_LEVEL) = level;
     reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(2 /*VSCOM*/, 0 /*PLAYING1*/);
     const int c1 = envInt("SFE_P1_CHAR", CHARACTER_CIRNO, 0, 19);
-    const int c2 = envInt("SFE_P2_CHAR", CHARACTER_CIRNO, 0, 19);
+    const int c2 = vscomOpponent();
     // A mirror match needs a second palette or the two are indistinguishable on
     // screen -- irrelevant to the state, not to anyone watching the video.
     writeSetupPlayer(ADDR_SETUP_LEFT,  c1, envInt("SFE_P1_PAL", 0, 0, 7),
@@ -925,6 +941,13 @@ static void vscomStart() {
     writeSetupPlayer(ADDR_SETUP_RIGHT, c2, envInt("SFE_P2_PAL", c1 == c2 ? 1 : 0, 0, 7),
                      envInt("SFE_P2_DECK", 0, 0, 3));
     reinterpret_cast<PFN_prepareBattle>(ADDR_PREPARE_BATTLE)(0);
+    if (sfe::agent::connected()) {
+        char m[96];
+        const int n = snprintf(m, sizeof(m), "M %d %d %d %u %u\n", c1, c2, level,
+                               *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT + PI_DECK_SIZE),
+                               *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_RIGHT + PI_DECK_SIZE));
+        sfe::agent::sendAll(m, n);
+    }
     sfe::log("vscom: start p1 char %u deck %u (%u cards) vs COM char %u (%u cards), "
              "COM level setup=%d config=%d",
              *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT),
@@ -2466,9 +2489,9 @@ static void agentRecordInputs(void* p1obj, void* p2obj) {
 static bool agentHandshake() {
     s_ag_ticks      = envInt("SFE_AGENT_TICKS", 5, 1, 16);
     s_ag_timeout_ms = envInt("SFE_AGENT_TIMEOUT_MS", 10000, 100, 600000);
-    int n = snprintf(s_ag_line, sizeof(s_ag_line), "H 1 %d %d %d %d\nC ",
+    int n = snprintf(s_ag_line, sizeof(s_ag_line), "H 2 %d %d %d %d\nC ",
                      envInt("SFE_P1_CHAR", CHARACTER_CIRNO, 0, 19),
-                     envInt("SFE_P2_CHAR", CHARACTER_CIRNO, 0, 19),
+                     envInt("SFE_P2_CHAR", CHARACTER_CIRNO, -1, 19),
                      envInt("SFE_COM_LEVEL", 3, 0, 3), s_ag_ticks);
     const int k = sfe::formatStateHeader(s_ag_line + n, sizeof(s_ag_line) - n - 1);
     if (k < 0) return false;

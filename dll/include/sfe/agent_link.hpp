@@ -9,8 +9,11 @@ namespace agent {
 // agent can start listening before it launches the game and never has to find it. Text lines, one
 // message per line:
 //
-//   game  -> agent   H <protocol> <p1 char> <p2 char> <COM level> <ticks per decision>
+//   game  -> agent   H <protocol=2> <p1 char> <p2 char, -1 = random per match> <COM level>
+//                      <ticks per decision>
 //                    C <the capture CSV header>
+//                    M <p1 char> <p2 char> <COM level> <p1 cards> <p2 cards>
+//                      at every match start, no reply
 //                    S <matchState> <round> <p1 rounds won> <p2 rounds won>
 //                      <p1 word x ticks> <p2 word x ticks> <capture CSV row>
 //   agent -> game    A <w0> <w1> ... <w(ticks-1)>     P1's input words, one per tick
