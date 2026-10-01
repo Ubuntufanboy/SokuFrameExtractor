@@ -46,7 +46,12 @@ tar -C "$SRC" -cf - --exclude='*.dat' . | tar -x -C "$DST"
 # ...then hardlink those. `cp -l` fails across filesystems, which is the one
 # case where sharing is not possible and a real copy is the only option.
 for dat in "$SRC"/*.dat; do
-    cp -l "$dat" "$DST/" 2>/dev/null || cp "$dat" "$DST/"
+    # A hard link cannot cross filesystems. The fallback COPIES ~2 GB per clone, which once put
+    # ~2 TB on a shared filesystem unnoticed -- so say so every time it happens.
+    cp -l "$dat" "$DST/" 2>/dev/null || {
+        echo "clone-game: WARNING: cannot hard-link $dat into $DST (another filesystem?); COPYING it" >&2
+        cp "$dat" "$DST/"
+    }
 done
 
 echo "clone-game: $DST is $(du -sh "$DST" | cut -f1) apparent, of which \
