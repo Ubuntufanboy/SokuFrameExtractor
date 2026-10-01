@@ -180,7 +180,14 @@ def build_command(
             "-threads", str(max(1, threads)),
             "-pix_fmt", "yuv420p",   # required for broad playback compatibility
         ]
-    cmd += ["-movflags", "+faststart", str(out_mp4)]
+    # SFE_VIDEO_FRAGMENTED=1 writes a fragmented MP4 instead: playable up to the last fragment
+    # even if the encoder is killed. The vs-COM recordings need it -- their game is taken down by
+    # signal at the end of a session, and a +faststart file killed that way has no index at all
+    # ("moov atom not found"). Corpus captures, which end cleanly, keep +faststart.
+    if os.environ.get("SFE_VIDEO_FRAGMENTED") == "1":
+        cmd += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", str(out_mp4)]
+    else:
+        cmd += ["-movflags", "+faststart", str(out_mp4)]
     return cmd
 
 
