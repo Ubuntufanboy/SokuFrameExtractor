@@ -65,6 +65,13 @@ int formatStateHeader(char* buf, size_t cap) {
     // floats that turn every world-space label in this row into something a
     // screen-space model can be supervised against.
     app(o, "%s", ",cam_x,cam_y,cam_scale,cam_left,cam_top,cam_right,cam_bottom");
+    // The card hand, appended after the camera for the same reason. Card 0 is
+    // the one the card button uses; slots at or past hand_n are zero.
+    for (int p = 1; p <= 2; ++p) {
+        app(o, ",p%d_card_gauge,p%d_card_count,p%d_card_slots,p%d_hand_n", p, p, p, p);
+        for (int k = 0; k < MAX_HAND; ++k)
+            app(o, ",p%d_hand%d_id,p%d_hand%d_cost", p, k, p, k);
+    }
     return done(o);
 }
 
@@ -167,6 +174,15 @@ int formatStateRow(char* buf, size_t cap, const StateRow& r) {
     app(o, ",%.3f,%.3f,%.5f,%.3f,%.3f,%.3f,%.3f",
         cam.x, cam.y, cam.scale,
         cam.left, cam.top, cam.right, cam.bottom);
+    for (int p = 0; p < 2; ++p) {
+        const auto& s = p ? s2 : s1;
+        app(o, ",%u,%u,%u,%u",
+            static_cast<unsigned>(s.card_gauge), static_cast<unsigned>(s.card_count),
+            static_cast<unsigned>(s.card_slots), static_cast<unsigned>(s.hand_n));
+        for (int k = 0; k < MAX_HAND; ++k)
+            app(o, ",%u,%u", static_cast<unsigned>(s.hand_id[k]),
+                static_cast<unsigned>(s.hand_cost[k]));
+    }
     return done(o);
 }
 

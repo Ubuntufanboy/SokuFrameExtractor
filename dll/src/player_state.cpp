@@ -9,6 +9,34 @@ template <typename T>
 inline T rd(const char* base, int off) {
     return *reinterpret_cast<const T*>(base + off);
 }
+
+// The hand is a ring of Card* behind a pointer, so it is the second walk in the
+// capture that follows a pointer it did not get from a fixed address. A leaf
+// with only PODs, for the same __try reason as walkProjectiles. Returns the
+// number of cards written (at most MAX_HAND), 0 for an empty or refused ring,
+// -1 if a dereference faulted.
+int walkHand(const char* base, uint16_t* ids, uint16_t* costs) {
+    __try {
+        const char* h = base + CHAR_HAND_OFFSET;
+        const char* const* ring = rd<const char* const*>(h, HAND_BASE_OFFSET);
+        const int max = rd<int>(h, HAND_MAX_OFFSET);
+        const int sel = rd<int>(h, HAND_SELECTED_OFFSET);
+        const uint32_t size = rd<uint32_t>(h, HAND_SIZE_OFFSET);
+        if (!ring || max <= 0 || max > HAND_RING_SANITY || sel < 0 || size == 0)
+            return 0;
+        const int n = size > static_cast<uint32_t>(MAX_HAND) ? MAX_HAND
+                                                             : static_cast<int>(size);
+        for (int i = 0; i < n; ++i) {
+            const char* card = ring[(sel + i) % max];
+            if (!card) return i;
+            ids[i]   = rd<uint16_t>(card, 0);
+            costs[i] = rd<uint16_t>(card, 2);
+        }
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
 }  // namespace
 
 PlayerState readPlayerState(void* char_obj) {
@@ -53,6 +81,15 @@ PlayerState readPlayerState(void* char_obj) {
     s.combo_hits   = rd<uint16_t>(base, CHAR_COMBO_HITS_OFFSET);
     s.combo_damage = rd<uint16_t>(base, CHAR_COMBO_DAMAGE_OFFSET);
     s.combo_limit  = rd<uint16_t>(base, CHAR_COMBO_LIMIT_OFFSET);
+
+    s.card_gauge = rd<uint16_t>(base, CHAR_CARD_GAUGE_OFFSET);
+    s.card_count = rd<uint8_t>(base, CHAR_CARD_COUNT_OFFSET);
+    s.card_slots = rd<uint8_t>(base, CHAR_CARD_SLOTS_OFFSET);
+    const int n = walkHand(base, s.hand_id, s.hand_cost);
+    if (n < 0) {   // faulted part-way: report an empty hand, not a partial one
+        for (int i = 0; i < MAX_HAND; ++i) s.hand_id[i] = s.hand_cost[i] = 0;
+    }
+    s.hand_n = static_cast<uint8_t>(n < 0 ? 0 : n);
 
     const uint16_t a = s.action;
     // Correct guard, in the air or on the ground. AIR_GUARD sits between the

@@ -910,16 +910,95 @@ static void writeSetupPlayer(DWORD info, int character, int palette, int deck) {
 // match -- the user's guard against a policy that learns one opponent's habits
 // instead of the game -- from its own xorshift, seeded by SFE_SEED so each game
 // in a run has a different, reproducible schedule.
+//
+// SFE_P2_CHAR_WEIGHTS="w0,...,w19" (non-negative, any scale) makes that draw
+// weighted -- the opponent curriculum: most matches against the characters the
+// policy loses to, still a random character every match. Malformed or all-zero
+// weights fall back to uniform and say so in the log.
 static int vscomOpponent() {
     const int fixed = envInt("SFE_P2_CHAR", CHARACTER_CIRNO, -1, 19);
     if (fixed >= 0) return fixed;
     static uint32_t rng = 0;
+    static double cum[20];
+    static bool weighted = false;
     if (!rng) {
         rng = static_cast<uint32_t>(envInt("SFE_SEED", 1, 0, 1 << 30)) * 2654435761u + 0x9E3779B9u;
         if (!rng) rng = 1;
+        if (const char* w = getenv("SFE_P2_CHAR_WEIGHTS"); w && *w) {
+            double total = 0.0;
+            int k = 0;
+            const char* p = w;
+            for (; k < 20 && *p; ++k) {
+                char* end = nullptr;
+                const double x = strtod(p, &end);
+                if (end == p || x < 0.0) break;
+                total += x;
+                cum[k] = total;
+                p = *end == ',' ? end + 1 : end;
+            }
+            weighted = k == 20 && total > 0.0;
+            if (weighted) for (double& c : cum) c /= total;
+            sfe::log("vscom: SFE_P2_CHAR_WEIGHTS %s (%s)", w,
+                     weighted ? "weighted draw" : "MALFORMED: uniform draw");
+        }
     }
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-    return static_cast<int>(rng % 20);
+    if (!weighted) return static_cast<int>(rng % 20);
+    const double u = (rng >> 8) * (1.0 / 16777216.0);   // 24 bits in [0, 1)
+    for (int c = 0; c < 20; ++c)
+        if (u < cum[c]) return c;
+    return 19;
+}
+
+// A PlayerInfo's deck: a Deque<u16> at +0x08, laid out as MSVC's
+// (third_party/SokuLib/src/Deque.hpp): +0x04 table, +0x08 block count,
+// +0x0C offset, +0x10 size, eight u16 per block.
+//
+// Why it is read at all (2026-10-01): with no menus, the deck prepareBattle
+// builds is NOT the profile's slot -- a probe saw Cirno holding only cards
+// 100-103 and 200-202, none of which is in profile1p.pf's slot 0. So the
+// effective decks are logged, and SFE_P1_DECK_CARDS="c1,...,c20" overwrites P1's
+// in place after prepareBattle, before the loading scene reads it.
+static uint16_t* deckCard(DWORD info, uint32_t i) {
+    const DWORD dq = info + 0x08;
+    uint16_t** table = *reinterpret_cast<uint16_t***>(dq + 0x04);
+    const uint32_t blocks = *reinterpret_cast<uint32_t*>(dq + 0x08);
+    const uint32_t off = *reinterpret_cast<uint32_t*>(dq + 0x0C);
+    if (!table || !blocks) return nullptr;
+    const uint32_t k = off + i;
+    uint16_t* block = table[(k / 8) % blocks];
+    return block ? block + (k % 8) : nullptr;
+}
+
+static void formatDeck(DWORD info, char* out, size_t cap) {
+    const uint32_t size = *reinterpret_cast<volatile uint32_t*>(info + PI_DECK_SIZE);
+    size_t n = 0;
+    out[0] = 0;
+    for (uint32_t i = 0; i < size && i < 32 && n + 8 < cap; ++i) {
+        const uint16_t* c = deckCard(info, i);
+        n += snprintf(out + n, cap - n, i ? ",%u" : "%u", c ? static_cast<unsigned>(*c) : 65535u);
+    }
+}
+
+static void overrideP1Deck() {
+    const char* v = getenv("SFE_P1_DECK_CARDS");
+    if (!v || !*v) return;
+    uint16_t cards[32];
+    int n = 0;
+    for (const char* p = v; *p && n < 32;) {
+        char* end = nullptr;
+        const long x = strtol(p, &end, 10);
+        if (end == p || x < 0 || x > 999) { n = -1; break; }
+        cards[n++] = static_cast<uint16_t>(x);
+        p = *end == ',' ? end + 1 : end;
+    }
+    const uint32_t size = *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT + PI_DECK_SIZE);
+    if (n != static_cast<int>(size)) {
+        sfe::log("vscom: SFE_P1_DECK_CARDS has %d cards, the deck holds %u: NOT applied", n, size);
+        return;
+    }
+    for (int i = 0; i < n; ++i)
+        if (uint16_t* c = deckCard(ADDR_SETUP_LEFT, static_cast<uint32_t>(i))) *c = cards[i];
 }
 
 static void vscomStart() {
@@ -941,6 +1020,13 @@ static void vscomStart() {
     writeSetupPlayer(ADDR_SETUP_RIGHT, c2, envInt("SFE_P2_PAL", c1 == c2 ? 1 : 0, 0, 7),
                      envInt("SFE_P2_DECK", 0, 0, 3));
     reinterpret_cast<PFN_prepareBattle>(ADDR_PREPARE_BATTLE)(0);
+    overrideP1Deck();
+    {
+        char d1[200], d2[200];
+        formatDeck(ADDR_SETUP_LEFT, d1, sizeof(d1));
+        formatDeck(ADDR_SETUP_RIGHT, d2, sizeof(d2));
+        sfe::log("vscom: decks p1 [%s] COM [%s]", d1, d2);
+    }
     if (sfe::agent::connected()) {
         char m[96];
         const int n = snprintf(m, sizeof(m), "M %d %d %d %u %u\n", c1, c2, level,

@@ -215,6 +215,35 @@ struct ProjectileState {
     uint8_t  hitboxes = 0;       // >0 means it is live and can connect
 };
 
+// -------------------------------------------------------------------------
+// THE CARD HAND
+// -------------------------------------------------------------------------
+// Added 2026-10-01 for the vs-COM policy, which pressed the card button 165-420
+// times a minute against a human's ~16 and had no way to see whether a spell
+// was even in hand. Layout from third_party/SokuLib: CharacterManager.hpp and
+// Cards.hpp (`HandContainer`, which SokuLib itself marks "probably a generic
+// container" -- so the walk is SEH-guarded and sanity-bounded like the
+// projectile walk, and its values were checked in play: count rises on a draw,
+// falls by a spell's cost on a declaration).
+//
+//   +0x5E4 u16 cardGauge     progress toward the next card
+//   +0x5E6 u8  cardCount     cards in hand
+//   +0x5E7 u8  cardSlotCount hand capacity
+//   +0x5E8 HandContainer: +0x04 Card** base, +0x08 int max, +0x0C int
+//          selected, +0x10 u32 size. Card i (0 = the one the card button
+//          uses) is *base[(selected + i) % max]; Card = {u16 id, u16 cost}.
+constexpr int CHAR_CARD_GAUGE_OFFSET = 0x5E4;
+constexpr int CHAR_CARD_COUNT_OFFSET = 0x5E6;
+constexpr int CHAR_CARD_SLOTS_OFFSET = 0x5E7;
+constexpr int CHAR_HAND_OFFSET       = 0x5E8;
+constexpr int HAND_BASE_OFFSET       = 0x04;
+constexpr int HAND_MAX_OFFSET        = 0x08;
+constexpr int HAND_SELECTED_OFFSET   = 0x0C;
+constexpr int HAND_SIZE_OFFSET       = 0x10;
+constexpr int MAX_HAND               = 5;   // the game's own cap on slots
+// A ring larger than this is a garbage pointer, not a hand.
+constexpr int HAND_RING_SANITY       = 64;
+
 // Action ranges that matter, from third_party/SokuLib/src/Action.hpp. These are
 // the mechanic itself, not a proxy for it: the attacker's whole game is to make
 // the defender drop guard (a hit) or guard the wrong way (WRONGBLOCK, or a
@@ -295,6 +324,16 @@ struct PlayerState {
     // Ordered danger-first: everything with a live hitbox, nearest to the
     // opponent first, then everything else nearest first.
     ProjectileState proj[MAX_PROJECTILES];
+
+    // --- the card hand (see THE CARD HAND above) --------------------------
+    // hand_n is the number of cards actually read; it differs from
+    // card_count only if the walk refused or faulted, which then shows.
+    uint16_t card_gauge = 0;
+    uint8_t  card_count = 0;
+    uint8_t  card_slots = 0;
+    uint8_t  hand_n     = 0;
+    uint16_t hand_id[MAX_HAND]   = {};
+    uint16_t hand_cost[MAX_HAND] = {};
 };
 
 // Reads one character object. Null-safe: the battle manager can be null between
