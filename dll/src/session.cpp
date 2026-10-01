@@ -2731,7 +2731,13 @@ FrameTag Session::onFrame() {
         if (currentScene() != SCENE_BATTLE && s_vscom_loop) {
             // Wait out the loading scene for the title the results hook asked
             // for, then arm the next match from it.
-            if (!s_vs_left_ms) s_vs_left_ms = GetTickCount() | 1;
+            // 0 means "in battle", so a real timestamp of 0 is nudged to 1 -- never
+            // `| 1`, which can land one tick in the FUTURE: the unsigned elapsed
+            // time below then wraps to 2^32-1 and fails the 60 s check at once.
+            if (!s_vs_left_ms) {
+                s_vs_left_ms = GetTickCount();
+                if (!s_vs_left_ms) s_vs_left_ms = 1;
+            }
             if (currentScene() == SCENE_TITLE) {
                 ++s_vscom_matches_done;
                 sfe::log("vscom: match %d over, back at the title after %u ms",
