@@ -21,6 +21,8 @@ add_library(SokuFrameExtractor SHARED
     src/logger.cpp
     src/video_encoder.cpp
     src/ring_buffer.cpp
+    src/state_row.cpp
+    src/agent_link.cpp
     src/ogl_hook.cpp
 )
 
@@ -28,6 +30,7 @@ target_include_directories(SokuFrameExtractor PRIVATE include)
 
 target_link_libraries(SokuFrameExtractor PRIVATE
     shlwapi
+    ws2_32   # the vs-COM agent link (src/agent_link.cpp)
 )
 
 target_compile_definitions(SokuFrameExtractor PRIVATE

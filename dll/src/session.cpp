@@ -10,6 +10,8 @@
 #include "sfe/session.hpp"
 #include "sfe/logger.hpp"
 #include "sfe/player_state.hpp"
+#include "sfe/agent_link.hpp"
+#include "sfe/state_row.hpp"
 
 #include <shlwapi.h>
 
@@ -880,6 +882,11 @@ constexpr int   CHARACTER_CIRNO = 16;
 using PFN_prepareBattle = void (__cdecl*)(int);
 
 static bool s_vscom = false;
+// Restart a new match after each one instead of exiting: on whenever an agent
+// is attached (SFE_AGENT), or for a scripted run with SFE_VSCOM_MATCHES=N.
+static bool s_vscom_loop         = false;
+static int  s_vscom_matches_max  = 0;      // 0: no budget
+static int  s_vscom_matches_done = 0;
 
 static bool vscomRequested() {
     const char* v = getenv("SFE_VSCOM");
@@ -901,6 +908,8 @@ static void writeSetupPlayer(DWORD info, int character, int palette, int deck) {
 
 static void vscomStart() {
     s_vscom = true;
+    s_vscom_matches_max = envInt("SFE_VSCOM_MATCHES", 0, 0, 1 << 30);
+    s_vscom_loop = sfe::agent::requested() || s_vscom_matches_max > 0;
     guardInputDeviceSelector();
     // Before setBattleMode: it copies config+0x64 into the setup, and so does
     // prepareBattle. Writing setup+0 directly would be overwritten twice.
@@ -1144,7 +1153,7 @@ constexpr DWORD ADDR_KEY_MGR_P1 = ADDR_INPUT_MANAGER + 0xD8;  // 0x008987F0
 constexpr DWORD ADDR_KEY_MGR_P2 = ADDR_INPUT_MANAGER + 0xE0;  // 0x008987F8
 
 static void wireKeyManagers(void* p1obj, void* p2obj) {
-    if (!getenv("SFE_WIRE_KEYMGR")) return;
+    if (!getenv("SFE_WIRE_KEYMGR") && !s_vscom) return;
     void* o[2] = { p1obj, p2obj };
     const DWORD want[2] = { ADDR_KEY_MGR_P1, ADDR_KEY_MGR_P2 };
     for (int i = 0; i < 2; ++i) {
@@ -1882,6 +1891,9 @@ static void injectInit() {
              s_inject.frame + s_inject.len - 1);
 }
 
+static void agentTick(void* bm);   // vs COM agent link, defined with the vs COM loop below
+static void restoreBattleSceneHook();   // the vs COM results hook, same place
+
 static int __fastcall HookedBattleUpdate(void* This, void* edx) {
     injectInit();
     // `This` is the scene now, not the BattleManager, so the frame counter and
@@ -1896,6 +1908,7 @@ static int __fastcall HookedBattleUpdate(void* This, void* edx) {
     // just chose. Called unconditionally: the deterministic vehicle for a
     // counterfactual pair is a replay, where no policy runs at all.
     cfDrive(bm, bm_frame);
+    agentTick(bm);
     sweepStep();
     if (bm) {
         watchArm(*reinterpret_cast<void**>(
@@ -2220,8 +2233,10 @@ void Session::shutdown() {
     // are 12 crash dumps in the tree consistent with that.
     if (m_scene_hooked) {
         restoreSceneHook();
+        restoreBattleSceneHook();
         restorePreTickHook();
         restorePollHook();
+        sfe::agent::close();
         m_scene_hooked = false;
     }
 
@@ -2326,6 +2341,233 @@ static bool vscomWatchAfterBattle(int frame_index) {
     return GetTickCount() - s_vs_left_ms < 15000;
 }
 
+// The capture's input word for a character (Session::readPlayerInput is this).
+// A free function so the agent link writes the very same p1_input/p2_input
+// columns the sidecar does; peekKeyMap differs ("nonzero" vs "> 0").
+static uint16_t charInputWord(void* char_obj) {
+    if (!char_obj) return 0;
+
+    struct SWRCHARINPUT { int lr, ud, a, b, c, d, ch, s; };
+    auto* inp = reinterpret_cast<SWRCHARINPUT*>(
+                    reinterpret_cast<char*>(char_obj) + CHAR_INPUT_OFFSET);
+
+    uint16_t mask = 0;
+    if (inp->ud < 0) mask |= INPUT_UP;
+    if (inp->ud > 0) mask |= INPUT_DOWN;
+    if (inp->lr < 0) mask |= INPUT_LEFT;
+    if (inp->lr > 0) mask |= INPUT_RIGHT;
+    if (inp->a  > 0) mask |= INPUT_A;
+    if (inp->b  > 0) mask |= INPUT_B;
+    if (inp->c  > 0) mask |= INPUT_C;
+    if (inp->d  > 0) mask |= INPUT_D;
+    if (inp->ch > 0) mask |= INPUT_CHANGE;
+    if (inp->s  > 0) mask |= INPUT_SPELL;
+    return mask;
+}
+
+// -------------------------------------------------------------------------
+// The vs COM loop: restart after every match, and the lockstep agent link
+// -------------------------------------------------------------------------
+// After a vs COM match the result screen (matchState 6) waits for menu input
+// that never arrives headless: measured, the game sat in the battle scene until
+// a 60 000-frame cap. So the battle scene's onProcess is hooked and, at the
+// results, asks for the title instead -- whose own hook then starts the next
+// match. The title hook stays patched across scenes because it is a patch of
+// the title CLASS's vtable, not of one title object.
+static PFN_sceneProcess s_orig_battle_scene = nullptr;
+static DWORD*           s_battle_scene_vtbl = nullptr;
+
+static int __fastcall HookedBattleSceneProcess(void* This, void* edx) {
+    const int r = s_orig_battle_scene(This, edx);
+    if (!s_vscom_loop || r != SCENE_BATTLE) return r;
+    void* bm = *reinterpret_cast<void**>(ADDR_BATTLE_MANAGER);
+    if (bm && fieldAt<int32_t>(bm, BM_MATCH_STATE_OFFSET) == 6) return SCENE_TITLE;
+    return r;
+}
+
+static bool patchSlot(DWORD* vtbl, int slot, DWORD fn, DWORD* orig) {
+    DWORD oldProt = 0;
+    if (!VirtualProtect(vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) return false;
+    if (orig) *orig = vtbl[slot];
+    vtbl[slot] = fn;
+    DWORD tmp = 0;
+    VirtualProtect(vtbl, 8 * sizeof(DWORD), oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    return true;
+}
+
+static bool installBattleSceneHook() {
+    void* scene = currentSceneObject();
+    DWORD* vtbl = scene ? *reinterpret_cast<DWORD**>(scene) : nullptr;
+    if (!vtbl || vtbl == s_scene_vtbl) {
+        sfe::log("vscom: no battle scene vtable to hook (scene=%p vtbl=%p)", scene, vtbl);
+        return false;
+    }
+    DWORD orig = 0;
+    if (!patchSlot(vtbl, VTBL_SCENE_ONPROCESS, reinterpret_cast<DWORD>(HookedBattleSceneProcess),
+                   &orig)) {
+        sfe::log("vscom: VirtualProtect on battle scene vtable %p failed (GLE=%lu)", vtbl,
+                 GetLastError());
+        return false;
+    }
+    s_battle_scene_vtbl = vtbl;
+    s_orig_battle_scene = reinterpret_cast<PFN_sceneProcess>(orig);
+    sfe::log("vscom: battle scene onProcess hooked (vtbl=%p orig=%p): results -> title",
+             vtbl, reinterpret_cast<void*>(orig));
+    return true;
+}
+
+static void restoreBattleSceneHook() {
+    if (!s_battle_scene_vtbl || !s_orig_battle_scene) return;
+    patchSlot(s_battle_scene_vtbl, VTBL_SCENE_ONPROCESS,
+              reinterpret_cast<DWORD>(s_orig_battle_scene), nullptr);
+    s_battle_scene_vtbl = nullptr;
+    s_orig_battle_scene = nullptr;
+}
+
+// The agent link. One exchange every SFE_AGENT_TICKS game ticks of FIGHT
+// (matchState 2), counted from the first fight tick of each round, plus one on
+// the tick a round stops -- that row carries the KO, which the agent needs to
+// score the last step. Ticks, not battle_frame: battle_frame freezes during
+// hitstop, and one capture row is one tick (measured, median delta 1 in the
+// corpus and in vs COM), so a decision covers exactly the 5 rows a corpus step
+// does. Outside the fight P1 is held neutral.
+static int      s_ag_ticks      = 5;
+static int      s_ag_timeout_ms = 10000;
+static int      s_ag_prev_state = -1;
+static long     s_ag_fight_tick = 0;
+static uint16_t s_ag_chunk[16]  = {};
+static int      s_ag_chunk_n    = 0;
+static int      s_ag_chunk_i    = 0;
+static long     s_ag_sent       = 0;
+static long     s_ag_timeouts   = 0;
+static DWORD    s_ag_wait_ms    = 0;
+static char     s_ag_line[STATE_ROW_CAP + 256];
+// Both players' input words for the last s_ag_ticks ticks, oldest first. A
+// policy's observation includes the joint action history -- every tick's
+// buttons for BOTH players, as the corpus records them -- and a row sent every
+// fifth tick shows only one tick of the COM's input. Each word is read from the
+// character itself (char+0x754, the capture's own source) on the following
+// tick's pre-tick, when the tick that used it has finished.
+static uint16_t s_ag_hist[2][16] = {};
+static int      s_ag_hist_n      = 0;
+
+static void agentRecordInputs(void* p1obj, void* p2obj) {
+    if (s_ag_hist_n == s_ag_ticks) {
+        for (int p = 0; p < 2; ++p)
+            memmove(s_ag_hist[p], s_ag_hist[p] + 1, (s_ag_ticks - 1) * sizeof(uint16_t));
+        --s_ag_hist_n;
+    }
+    s_ag_hist[0][s_ag_hist_n] = charInputWord(p1obj);
+    s_ag_hist[1][s_ag_hist_n] = charInputWord(p2obj);
+    ++s_ag_hist_n;
+}
+
+static bool agentHandshake() {
+    s_ag_ticks      = envInt("SFE_AGENT_TICKS", 5, 1, 16);
+    s_ag_timeout_ms = envInt("SFE_AGENT_TIMEOUT_MS", 10000, 100, 600000);
+    int n = snprintf(s_ag_line, sizeof(s_ag_line), "H 1 %d %d %d %d\nC ",
+                     envInt("SFE_P1_CHAR", CHARACTER_CIRNO, 0, 19),
+                     envInt("SFE_P2_CHAR", CHARACTER_CIRNO, 0, 19),
+                     envInt("SFE_COM_LEVEL", 3, 0, 3), s_ag_ticks);
+    const int k = sfe::formatStateHeader(s_ag_line + n, sizeof(s_ag_line) - n - 1);
+    if (k < 0) return false;
+    n += k;
+    s_ag_line[n++] = '\n';
+    return sfe::agent::sendAll(s_ag_line, n);
+}
+
+static bool agentExchange(void* bm, void* p1obj, void* p2obj, int state) {
+    sfe::PlayerState a = sfe::readPlayerState(p1obj);
+    sfe::PlayerState b = sfe::readPlayerState(p2obj);
+    sfe::readProjectiles(p1obj, b.x, b.y, &a);   // the capture's own order
+    sfe::readProjectiles(p2obj, a.x, a.y, &b);
+    const sfe::CameraState cam = sfe::readCamera();
+    const sfe::StateRow row{ static_cast<int>(s_ag_sent), static_cast<int>(s_ag_fight_tick),
+                             fieldAt<uint32_t>(bm, BM_FRAME_COUNT_OFFSET),
+                             charInputWord(p1obj), charInputWord(p2obj), &a, &b, &cam };
+    int n = snprintf(s_ag_line, sizeof(s_ag_line), "S %d %d %d %d", state,
+                     static_cast<int>(fieldAt<int8_t>(bm, BM_ROUND_OFFSET)),
+                     static_cast<int>(fieldAt<int8_t>(p1obj, CHAR_SCORE_OFFSET)),
+                     static_cast<int>(fieldAt<int8_t>(p2obj, CHAR_SCORE_OFFSET)));
+    // Then s_ag_ticks words for P1 and s_ag_ticks for P2, oldest first, zero-
+    // padded at the front when fewer ticks have passed (a round's first decision).
+    for (int p = 0; p < 2; ++p)
+        for (int i = 0; i < s_ag_ticks; ++i) {
+            const int j = i - (s_ag_ticks - s_ag_hist_n);
+            n += snprintf(s_ag_line + n, sizeof(s_ag_line) - n, " %u",
+                          j >= 0 ? static_cast<unsigned>(s_ag_hist[p][j]) : 0u);
+        }
+    s_ag_line[n++] = ' ';
+    const int k = sfe::formatStateRow(s_ag_line + n, sizeof(s_ag_line) - n - 1, row);
+    if (k < 0) {
+        sfe::log("agent: state row does not fit; link closed");
+        sfe::agent::close();
+        return false;
+    }
+    n += k;
+    s_ag_line[n++] = '\n';
+    if (!sfe::agent::sendAll(s_ag_line, n)) return false;
+    ++s_ag_sent;
+    char reply[512];
+    const DWORD t0 = GetTickCount();
+    if (!sfe::agent::recvLine(reply, sizeof(reply), s_ag_timeout_ms)) {
+        if (++s_ag_timeouts <= 5 || s_ag_timeouts % 100 == 0)
+            sfe::log("agent: no reply within %d ms (%ld so far)%s", s_ag_timeout_ms,
+                     s_ag_timeouts, sfe::agent::connected() ? "" : "; link is down");
+        return false;
+    }
+    s_ag_wait_ms += GetTickCount() - t0;
+    if (reply[0] != 'A') {
+        sfe::log("agent: expected an A line, got '%.40s'", reply);
+        return false;
+    }
+    char* p = reply + 1;
+    s_ag_chunk_n = 0;
+    while (s_ag_chunk_n < s_ag_ticks) {
+        char* end = nullptr;
+        const long w = strtol(p, &end, 10);
+        if (end == p) break;
+        s_ag_chunk[s_ag_chunk_n++] = static_cast<uint16_t>(w);
+        p = end;
+    }
+    s_ag_chunk_i = 0;
+    return true;
+}
+
+static void agentTick(void* bm) {
+    if (!s_vscom || !sfe::agent::requested() || !bm) return;
+    void* p1obj = *reinterpret_cast<void**>(reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
+    void* p2obj = *reinterpret_cast<void**>(reinterpret_cast<char*>(bm) + BM_PLAYER2_OFFSET);
+    if (!p1obj || !p2obj) return;
+    const int  state = fieldAt<int32_t>(bm, BM_MATCH_STATE_OFFSET);
+    const bool fight = state == 2;
+    if (fight && s_ag_prev_state != 2) {         // a round's first fight tick
+        s_ag_fight_tick = 0;
+        s_ag_chunk_n = s_ag_chunk_i = 0;
+        s_ag_hist_n = 0;
+    }
+    const bool ended = s_ag_prev_state == 2 && !fight;
+    // The tick that just finished was a fight tick: record what both played.
+    if (s_ag_prev_state == 2) agentRecordInputs(p1obj, p2obj);
+    if (sfe::agent::connected() && (ended || (fight && s_ag_fight_tick % s_ag_ticks == 0))) {
+        if (!agentExchange(bm, p1obj, p2obj, state)) s_ag_chunk_n = s_ag_chunk_i = 0;
+    }
+    if (ended) {
+        s_ag_chunk_n = s_ag_chunk_i = 0;
+        sfe::log("agent: round over (matchState %d): score %d-%d, %ld decisions sent, %ld timeouts, "
+                 "mean agent wait %.2f ms", state,
+                 static_cast<int>(fieldAt<int8_t>(p1obj, CHAR_SCORE_OFFSET)),
+                 static_cast<int>(fieldAt<int8_t>(p2obj, CHAR_SCORE_OFFSET)),
+                 s_ag_sent, s_ag_timeouts,
+                 s_ag_sent ? static_cast<double>(s_ag_wait_ms) / s_ag_sent : 0.0);
+    }
+    s_kmm_word[0]  = fight && s_ag_chunk_i < s_ag_chunk_n ? s_ag_chunk[s_ag_chunk_i++] : 0;
+    s_kmm_drive[0] = true;
+    if (fight) ++s_ag_fight_tick;
+    s_ag_prev_state = state;
+}
+
 FrameTag Session::onFrame() {
     FrameTag tag{ false, 0, 0, 0 };
 
@@ -2374,6 +2616,14 @@ FrameTag Session::onFrame() {
             break;
         }
         m_scene_hooked = true;
+        if (vscomRequested() && sfe::agent::requested()) {
+            // The agent listens before it launches the game, so a minute is
+            // generous; past it the run is pointless, not degraded.
+            if (!sfe::agent::connect(60000) || !agentHandshake()) {
+                finish(AutoState::FAILED, "the vs COM agent link never came up");
+                break;
+            }
+        }
         transitionTo(AutoState::ENTER_REPLAY_MENU);
         break;
     }
@@ -2465,7 +2715,8 @@ FrameTag Session::onFrame() {
                          scene, elapsedMs());
             }
         }
-        if (m_state == AutoState::START_REPLAY && elapsedMs() > MS_BATTLE_DEADLINE) {
+        if (m_state == AutoState::START_REPLAY
+            && GetTickCount() - m_state_tick > MS_BATTLE_DEADLINE) {
             // No retry. The old code re-ran the entire key script from a game
             // that was no longer at the title screen, firing 13 more presses
             // into an arbitrary menu -- a livelock, not a recovery. The runner
@@ -2477,6 +2728,34 @@ FrameTag Session::onFrame() {
 
     // ------------------------------------------------------------------
     case AutoState::EXTRACTING: {
+        if (currentScene() != SCENE_BATTLE && s_vscom_loop) {
+            // Wait out the loading scene for the title the results hook asked
+            // for, then arm the next match from it.
+            if (!s_vs_left_ms) s_vs_left_ms = GetTickCount() | 1;
+            if (currentScene() == SCENE_TITLE) {
+                ++s_vscom_matches_done;
+                sfe::log("vscom: match %d over, back at the title after %u ms",
+                         s_vscom_matches_done, GetTickCount() - s_vs_left_ms);
+                s_vs_left_ms = 0;
+                if (s_vscom_matches_max && s_vscom_matches_done >= s_vscom_matches_max) {
+                    finish(AutoState::DRAINING, nullptr);
+                    break;
+                }
+                if (sfe::agent::requested() && !sfe::agent::connected()) {
+                    // The agent hung up or died. Exit, so whoever launched the
+                    // game sees it, rather than playing on with nobody there.
+                    sfe::log("vscom: the agent link is down; exiting");
+                    finish(AutoState::DRAINING, nullptr);
+                    break;
+                }
+                m_start_armed = false;
+                InterlockedExchange(&s_start_done, 0);
+                transitionTo(AutoState::ENTER_REPLAY_MENU);
+            } else if (GetTickCount() - s_vs_left_ms > 60000) {
+                finish(AutoState::FAILED, "never got back to the title after a vs COM match");
+            }
+            break;
+        }
         if (currentScene() != SCENE_BATTLE) {
             if (s_vscom && vscomWatchAfterBattle(m_frame_index)) break;
             sfe::log("Scene left battle at frame %d", m_frame_index);
@@ -2545,9 +2824,17 @@ FrameTag Session::onFrame() {
             // objects, on frames the game is already being read on.
             mirrorScan(p1, p2, p1obj, p2obj);
             vscomObserve(bm, p1obj, p2obj, p2, p1s, p2s, battle_frame);
+            if (s_vscom_loop) {
+                wireKeyManagers(p1obj, nullptr);     // idempotent; new objects each match
+                if (!s_battle_scene_vtbl) installBattleSceneHook();
+            }
             sweepObserve(s_sweep_player == 2 ? p2 : p1);
         }
 
+        // A looping run records nothing by default: at ~2.5 KB a row and ~100
+        // rows/s it would be ~0.9 GB/hour per game. SFE_AGENT_CAPTURE=1 keeps
+        // the sidecar (a recorded evaluation).
+        if (s_vscom_loop && !getenv("SFE_AGENT_CAPTURE")) break;
         tag.capture      = true;
         // SCAN AND PATCH DURING PLAYBACK, NOT AT LOAD.
         //
@@ -2768,24 +3055,7 @@ bool Session::findStagedReplay() {
 // Input reading
 // =========================================================================
 uint16_t Session::readPlayerInput(void* char_obj) const {
-    if (!char_obj) return 0;
-
-    struct SWRCHARINPUT { int lr, ud, a, b, c, d, ch, s; };
-    auto* inp = reinterpret_cast<SWRCHARINPUT*>(
-                    reinterpret_cast<char*>(char_obj) + CHAR_INPUT_OFFSET);
-
-    uint16_t mask = 0;
-    if (inp->ud < 0) mask |= INPUT_UP;
-    if (inp->ud > 0) mask |= INPUT_DOWN;
-    if (inp->lr < 0) mask |= INPUT_LEFT;
-    if (inp->lr > 0) mask |= INPUT_RIGHT;
-    if (inp->a  > 0) mask |= INPUT_A;
-    if (inp->b  > 0) mask |= INPUT_B;
-    if (inp->c  > 0) mask |= INPUT_C;
-    if (inp->d  > 0) mask |= INPUT_D;
-    if (inp->ch > 0) mask |= INPUT_CHANGE;
-    if (inp->s  > 0) mask |= INPUT_SPELL;
-    return mask;
+    return charInputWord(char_obj);
 }
 
 // =========================================================================
