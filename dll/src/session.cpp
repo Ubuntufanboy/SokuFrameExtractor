@@ -882,6 +882,12 @@ constexpr int   CHARACTER_CIRNO = 16;
 using PFN_prepareBattle = void (__cdecl*)(int);
 
 static bool s_vscom = false;
+// SFE_VERSUS=1: a local VERSUS match (battle mode 3) instead of vs COM, both characters fixed --
+// a person on one side with their own keyboard/pad, the agent on the other. SFE_AGENT_SIDE (1 or
+// 2) says which chair the agent's words drive; the other player's input is left to the game.
+// Added 2026-10-06 so the user can play the BC policy.
+static bool s_versus  = false;
+static int  s_ag_side = 0;                 // 0 = P1, 1 = P2
 // Restart a new match after each one instead of exiting: on whenever an agent
 // is attached (SFE_AGENT), or for a scripted run with SFE_VSCOM_MATCHES=N.
 static bool s_vscom_loop         = false;
@@ -980,8 +986,8 @@ static void formatDeck(DWORD info, char* out, size_t cap) {
     }
 }
 
-static void overrideP1Deck() {
-    const char* v = getenv("SFE_P1_DECK_CARDS");
+static void overrideDeck(DWORD info, const char* var) {
+    const char* v = getenv(var);
     if (!v || !*v) return;
     uint16_t cards[32];
     int n = 0;
@@ -992,13 +998,13 @@ static void overrideP1Deck() {
         cards[n++] = static_cast<uint16_t>(x);
         p = *end == ',' ? end + 1 : end;
     }
-    const uint32_t size = *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT + PI_DECK_SIZE);
+    const uint32_t size = *reinterpret_cast<volatile uint32_t*>(info + PI_DECK_SIZE);
     if (n != static_cast<int>(size)) {
-        sfe::log("vscom: SFE_P1_DECK_CARDS has %d cards, the deck holds %u: NOT applied", n, size);
+        sfe::log("vscom: %s has %d cards, the deck holds %u: NOT applied", var, n, size);
         return;
     }
     for (int i = 0; i < n; ++i)
-        if (uint16_t* c = deckCard(ADDR_SETUP_LEFT, static_cast<uint32_t>(i))) *c = cards[i];
+        if (uint16_t* c = deckCard(info, static_cast<uint32_t>(i))) *c = cards[i];
 }
 
 static void vscomStart() {
@@ -1010,9 +1016,12 @@ static void vscomStart() {
     // prepareBattle. Writing setup+0 directly would be overwritten twice.
     const int level = envInt("SFE_COM_LEVEL", 3, 0, 3);
     *reinterpret_cast<volatile int32_t*>(ADDR_CONFIG_COM_LEVEL) = level;
-    reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(2 /*VSCOM*/, 0 /*PLAYING1*/);
+    s_versus  = envInt("SFE_VERSUS", 0, 0, 1) == 1;
+    s_ag_side = envInt("SFE_AGENT_SIDE", 1, 1, 2) - 1;
+    reinterpret_cast<PFN_setBattleMode>(ADDR_SET_BATTLE_MODE)(s_versus ? 3 /*VSPLAYER*/ : 2 /*VSCOM*/,
+                                                               0 /*PLAYING1*/);
     const int c1 = envInt("SFE_P1_CHAR", CHARACTER_CIRNO, 0, 19);
-    const int c2 = vscomOpponent();
+    const int c2 = s_versus ? envInt("SFE_P2_CHAR", CHARACTER_CIRNO, 0, 19) : vscomOpponent();
     // A mirror match needs a second palette or the two are indistinguishable on
     // screen -- irrelevant to the state, not to anyone watching the video.
     writeSetupPlayer(ADDR_SETUP_LEFT,  c1, envInt("SFE_P1_PAL", 0, 0, 7),
@@ -1020,7 +1029,8 @@ static void vscomStart() {
     writeSetupPlayer(ADDR_SETUP_RIGHT, c2, envInt("SFE_P2_PAL", c1 == c2 ? 1 : 0, 0, 7),
                      envInt("SFE_P2_DECK", 0, 0, 3));
     reinterpret_cast<PFN_prepareBattle>(ADDR_PREPARE_BATTLE)(0);
-    overrideP1Deck();
+    overrideDeck(ADDR_SETUP_LEFT, "SFE_P1_DECK_CARDS");
+    overrideDeck(ADDR_SETUP_RIGHT, "SFE_P2_DECK_CARDS");
     {
         char d1[200], d2[200];
         formatDeck(ADDR_SETUP_LEFT, d1, sizeof(d1));
@@ -1034,6 +1044,8 @@ static void vscomStart() {
                                *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_RIGHT + PI_DECK_SIZE));
         sfe::agent::sendAll(m, n);
     }
+    sfe::log("vscom: mode %s, agent drives P%d", s_versus ? "VERSUS (a person on the other side)"
+                                                          : "vs COM", s_ag_side + 1);
     sfe::log("vscom: start p1 char %u deck %u (%u cards) vs COM char %u (%u cards), "
              "COM level setup=%d config=%d",
              *reinterpret_cast<volatile uint32_t*>(ADDR_SETUP_LEFT),
@@ -1623,11 +1635,11 @@ static bool installPollHook(void* p1obj, void* p2obj) {
     // vs COM: P2 is the game's AI. Never wire its key manager (that would hand
     // its input to an inert static manager) and never record it as ours, so the
     // poll hook below cannot touch it even when both managers share a vtable.
-    if (s_vscom) p2obj = nullptr;
+    if (s_vscom && !s_versus) p2obj = nullptr;
     wireKeyManagers(p1obj, p2obj);
     s_kmm[0] = keymapManagerOf(p1obj);
     s_kmm[1] = keymapManagerOf(p2obj);
-    if (!s_kmm[0] || (!s_vscom && !s_kmm[1])) {
+    if (!s_kmm[0] || ((!s_vscom || s_versus) && !s_kmm[1])) {
         sfe::log("pollHook: no KeymapManager (p1=%p p2=%p) -- char+0x750 is "
                  "null, so 0x0046C8E0 skips the copy entirely and this player "
                  "is not driven from a manager at all", s_kmm[0], s_kmm[1]);
@@ -2644,6 +2656,55 @@ static bool agentExchange(void* bm, void* p1obj, void* p2obj, int state) {
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// A person's input, over UDP (versus mode, SFE_HUMAN_UDP=<port>)
+// ---------------------------------------------------------------------------------------------
+// In the bwrap sandbox DirectInput enumerates no devices, so the game itself reads nothing for
+// the person's chair. Their pad is read on the host instead and its state sent here as 2-byte
+// little-endian input words (bit i = BUTTONS[i], the agent's encoding) to 127.0.0.1:<port>. Each
+// tick takes the newest word and writes it into that player's KeyInput through the same poll hook
+// that drives the agent -- so the person is as live as the agent, with under a tick of latency.
+static SOCKET   s_human_sock = INVALID_SOCKET;
+static uint16_t s_human_word = 0;
+static bool     s_human_init = false;
+
+static void humanInit() {
+    if (s_human_init) return;
+    s_human_init = true;
+    const int port = envInt("SFE_HUMAN_UDP", 0, 0, 65535);
+    if (!port) return;
+    WSADATA wd;
+    WSAStartup(MAKEWORD(2, 2), &wd);
+    SOCKET sk = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sk == INVALID_SOCKET) { sfe::log("human: socket failed (%d)", WSAGetLastError()); return; }
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(static_cast<u_short>(port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(sk, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        sfe::log("human: bind 127.0.0.1:%d failed (%d)", port, WSAGetLastError());
+        closesocket(sk);
+        return;
+    }
+    u_long nb = 1;
+    ioctlsocket(sk, FIONBIO, &nb);
+    s_human_sock = sk;
+    sfe::log("human: P%d's input from udp 127.0.0.1:%d", 2 - s_ag_side, port);
+}
+
+// The newest word waiting, or the last one if none arrived this tick.
+static uint16_t humanWord() {
+    if (s_human_sock == INVALID_SOCKET) return s_human_word;
+    char b[16];
+    for (;;) {
+        const int n = recv(s_human_sock, b, sizeof(b), 0);
+        if (n < 2) break;
+        s_human_word = static_cast<uint16_t>(static_cast<uint8_t>(b[0]) |
+                                             (static_cast<uint8_t>(b[1]) << 8));
+    }
+    return s_human_word;
+}
+
 static void agentTick(void* bm) {
     if (!s_vscom || !sfe::agent::requested() || !bm) return;
     void* p1obj = *reinterpret_cast<void**>(reinterpret_cast<char*>(bm) + BM_PLAYER1_OFFSET);
@@ -2671,8 +2732,17 @@ static void agentTick(void* bm) {
                  s_ag_sent, s_ag_timeouts,
                  s_ag_sent ? static_cast<double>(s_ag_wait_ms) / s_ag_sent : 0.0);
     }
-    s_kmm_word[0]  = fight && s_ag_chunk_i < s_ag_chunk_n ? s_ag_chunk[s_ag_chunk_i++] : 0;
-    s_kmm_drive[0] = true;
+    s_kmm_word[s_ag_side]      = fight && s_ag_chunk_i < s_ag_chunk_n ? s_ag_chunk[s_ag_chunk_i++] : 0;
+    s_kmm_drive[s_ag_side]     = true;
+    // The other chair: the COM's (never ours), or in versus a person's -- driven from their pad
+    // over UDP when SFE_HUMAN_UDP is set, else left to whatever device the game reads.
+    if (s_versus) humanInit();
+    if (s_versus && s_human_sock != INVALID_SOCKET) {
+        s_kmm_word[1 - s_ag_side]  = humanWord();
+        s_kmm_drive[1 - s_ag_side] = true;
+    } else {
+        s_kmm_drive[1 - s_ag_side] = false;
+    }
     if (fight) ++s_ag_fight_tick;
     s_ag_prev_state = state;
 }
@@ -2940,7 +3010,7 @@ FrameTag Session::onFrame() {
             mirrorScan(p1, p2, p1obj, p2obj);
             vscomObserve(bm, p1obj, p2obj, p2, p1s, p2s, battle_frame);
             if (s_vscom_loop) {
-                wireKeyManagers(p1obj, nullptr);     // idempotent; new objects each match
+                wireKeyManagers(p1obj, s_versus ? p2obj : nullptr);   // idempotent; new objects each match
                 if (!s_battle_scene_vtbl) installBattleSceneHook();
             }
             sweepObserve(s_sweep_player == 2 ? p2 : p1);

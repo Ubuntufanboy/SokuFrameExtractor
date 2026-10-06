@@ -160,6 +160,13 @@ class Xvfb:
     _wm: subprocess.Popen | None = field(default=None, repr=False)
 
     def __enter__(self) -> "Xvfb":
+        # SFE_LIVE_DISPLAY=<n>: a person is going to PLAY this game, so it goes on their own X
+        # display (bound in by sfe-bwrap's SFE_LIVE=1) instead of a private Xvfb -- no server and
+        # no window manager are started, and none is torn down on exit.
+        live = os.environ.get("SFE_LIVE_DISPLAY")
+        if live:
+            self.display = int(live.lstrip(":"))
+            return self
         if not shutil.which("Xvfb"):
             raise WineError("Xvfb not found on PATH")
         self._proc = subprocess.Popen(
@@ -342,7 +349,9 @@ def run_game(
     # inside the same budget. Applying it later, to the game process, would be
     # too late -- llvmpipe has already sized its thread pool from the mask it
     # saw at startup.
-    argv = throttle.wrap([wine_bin(), GAME_EXE], n_cpus=n_cpus)
+    # SFE_NICE=0 for a game a person is playing: the capture default (19) yields to everything.
+    argv = throttle.wrap([wine_bin(), GAME_EXE], n_cpus=n_cpus,
+                         nice=int(os.environ.get("SFE_NICE", throttle.DEFAULT_NICE)))
 
     log = open(log_path, "wb") if log_path else subprocess.DEVNULL
     try:

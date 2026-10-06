@@ -265,7 +265,8 @@ def capture_one(
         output_dir=out_dir,
         fifo=fifo,
         status=status_path,
-        fast_forward=True,
+        # SFE_FAST_FORWARD=0 keeps the game's 60 fps frame limiter: a person is playing it.
+        fast_forward=os.environ.get("SFE_FAST_FORWARD", "1") != "0",
         verbose=verbose,
     )
 

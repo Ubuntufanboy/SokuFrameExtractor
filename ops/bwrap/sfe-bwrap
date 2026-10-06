@@ -63,6 +63,8 @@ NET=()
 # enumerates /dev/input ONCE at startup, so the game must see the real device
 # tree at launch or the pad does not exist for the rest of the session.
 LIVE=()
+IPC=(--unshare-ipc)
+GLENV=()
 if [ "${SFE_LIVE:-0}" = "1" ]; then
     # Placed AFTER --dev and --tmpfs /tmp in the argument list below, because
     # bwrap applies mounts in order and the last one wins: listed first, the
@@ -70,6 +72,24 @@ if [ "${SFE_LIVE:-0}" = "1" ]; then
     # vanish again.
     LIVE=(--dev-bind /dev /dev --bind /tmp/.X11-unix /tmp/.X11-unix)
     NET=()          # a live match talks to the policy server
+    # The game draws on the HOST's X server, and Mesa's software path hands it frames through
+    # SysV shared memory, which an unshared IPC namespace hides from the server.
+    IPC=()
+    # The host X server checks a cookie, and the sandbox's /tmp is its own: pass the cookie in
+    # read-only rather than opening the server up with xhost.
+    # A person plays at 60 fps, which software GL could not hold on the user's 4-core laptop
+    # (~30 fps). The real /dev is bound, so render on the GPU (crocus = Intel Gen7/7.5, the user's
+    # Haswell) unless SFE_LIVE_GL=sw.
+    if [ "${SFE_LIVE_GL:-hw}" != "sw" ]; then
+        # Mesa identifies the GPU through /sys ("MESA-LOADER: failed to retrieve device
+        # information" without it); MESA_LOADER_DRIVER_OVERRIDE names the DRI driver and leaves
+        # GALLIUM_DRIVER (llvmpipe) for the software fallback.
+        GLENV=(--ro-bind /sys /sys --setenv LIBGL_ALWAYS_SOFTWARE 0
+               --setenv MESA_LOADER_DRIVER_OVERRIDE "${SFE_MESA_DRIVER:-crocus}")
+    fi
+    if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+        LIVE+=(--ro-bind "$XAUTHORITY" /tmp/.sfe-xauth --setenv XAUTHORITY /tmp/.sfe-xauth)
+    fi
 fi
 
 exec bwrap \
@@ -95,9 +115,10 @@ exec bwrap \
     --setenv PYTHONPATH /app \
     --setenv LIBGL_ALWAYS_SOFTWARE 1 \
     --setenv GALLIUM_DRIVER llvmpipe \
+    "${GLENV[@]}" \
     --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     --chdir /app \
     --unshare-pid \
-    --unshare-ipc \
+    "${IPC[@]}" \
     --die-with-parent \
     "$@"
