@@ -2560,6 +2560,10 @@ static long     s_ag_fight_tick = 0;
 static uint16_t s_ag_chunk[16]  = {};
 static int      s_ag_chunk_n    = 0;
 static int      s_ag_chunk_i    = 0;
+// The other chair's chunk, from a B line (versus only): played on the same ticks, by the same
+// index, as s_ag_chunk. Zero when the last reply was an A line, failed, or a round reset it.
+static uint16_t s_ag_other[16]  = {};
+static int      s_ag_other_n    = 0;
 static long     s_ag_sent       = 0;
 static long     s_ag_timeouts   = 0;
 static DWORD    s_ag_wait_ms    = 0;
@@ -2639,8 +2643,8 @@ static bool agentExchange(void* bm, void* p1obj, void* p2obj, int state) {
         return false;
     }
     s_ag_wait_ms += GetTickCount() - t0;
-    if (reply[0] != 'A') {
-        sfe::log("agent: expected an A line, got '%.40s'", reply);
+    if (reply[0] != 'A' && reply[0] != 'B') {
+        sfe::log("agent: expected an A or B line, got '%.40s'", reply);
         return false;
     }
     char* p = reply + 1;
@@ -2651,6 +2655,27 @@ static bool agentExchange(void* bm, void* p1obj, void* p2obj, int state) {
         if (end == p) break;
         s_ag_chunk[s_ag_chunk_n++] = static_cast<uint16_t>(w);
         p = end;
+    }
+    s_ag_other_n = 0;
+    if (reply[0] == 'B') {
+        static bool warned = false;
+        if (!s_versus) {
+            if (!warned) sfe::log("agent: B line outside versus: the other chair is the COM's, ignored");
+            warned = true;
+        } else {
+            while (s_ag_other_n < s_ag_ticks) {
+                char* end = nullptr;
+                const long w = strtol(p, &end, 10);
+                if (end == p) break;
+                s_ag_other[s_ag_other_n++] = static_cast<uint16_t>(w);
+                p = end;
+            }
+            if (s_ag_other_n != s_ag_ticks && !warned) {
+                sfe::log("agent: B line carried %d of %d words for the other chair",
+                         s_ag_other_n, s_ag_ticks);
+                warned = true;
+            }
+        }
     }
     s_ag_chunk_i = 0;
     return true;
@@ -2714,17 +2739,18 @@ static void agentTick(void* bm) {
     const bool fight = state == 2;
     if (fight && s_ag_prev_state != 2) {         // a round's first fight tick
         s_ag_fight_tick = 0;
-        s_ag_chunk_n = s_ag_chunk_i = 0;
+        s_ag_chunk_n = s_ag_chunk_i = s_ag_other_n = 0;
         s_ag_hist_n = 0;
     }
     const bool ended = s_ag_prev_state == 2 && !fight;
     // The tick that just finished was a fight tick: record what both played.
     if (s_ag_prev_state == 2) agentRecordInputs(p1obj, p2obj);
     if (sfe::agent::connected() && (ended || (fight && s_ag_fight_tick % s_ag_ticks == 0))) {
-        if (!agentExchange(bm, p1obj, p2obj, state)) s_ag_chunk_n = s_ag_chunk_i = 0;
+        if (!agentExchange(bm, p1obj, p2obj, state))
+            s_ag_chunk_n = s_ag_chunk_i = s_ag_other_n = 0;
     }
     if (ended) {
-        s_ag_chunk_n = s_ag_chunk_i = 0;
+        s_ag_chunk_n = s_ag_chunk_i = s_ag_other_n = 0;
         sfe::log("agent: round over (matchState %d): score %d-%d, %ld decisions sent, %ld timeouts, "
                  "mean agent wait %.2f ms", state,
                  static_cast<int>(fieldAt<int8_t>(p1obj, CHAR_SCORE_OFFSET)),
@@ -2732,12 +2758,19 @@ static void agentTick(void* bm) {
                  s_ag_sent, s_ag_timeouts,
                  s_ag_sent ? static_cast<double>(s_ag_wait_ms) / s_ag_sent : 0.0);
     }
-    s_kmm_word[s_ag_side]      = fight && s_ag_chunk_i < s_ag_chunk_n ? s_ag_chunk[s_ag_chunk_i++] : 0;
+    const int  ci   = s_ag_chunk_i;
+    const bool live = fight && ci < s_ag_chunk_n;
+    s_kmm_word[s_ag_side]      = live ? s_ag_chunk[ci] : 0;
     s_kmm_drive[s_ag_side]     = true;
-    // The other chair: the COM's (never ours), or in versus a person's -- driven from their pad
-    // over UDP when SFE_HUMAN_UDP is set, else left to whatever device the game reads.
+    if (live) ++s_ag_chunk_i;
+    // The other chair: the COM's (never ours); in versus, the agent's second policy when its last
+    // reply was a B line, else a person's -- driven from their pad over UDP when SFE_HUMAN_UDP is
+    // set -- else whatever device the game reads.
     if (s_versus) humanInit();
-    if (s_versus && s_human_sock != INVALID_SOCKET) {
+    if (s_versus && s_ag_other_n > 0) {
+        s_kmm_word[1 - s_ag_side]  = fight && ci < s_ag_other_n ? s_ag_other[ci] : 0;
+        s_kmm_drive[1 - s_ag_side] = true;
+    } else if (s_versus && s_human_sock != INVALID_SOCKET) {
         s_kmm_word[1 - s_ag_side]  = humanWord();
         s_kmm_drive[1 - s_ag_side] = true;
     } else {

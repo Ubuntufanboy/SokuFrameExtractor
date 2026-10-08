@@ -16,14 +16,18 @@ namespace agent {
 //                      at every match start, no reply
 //                    S <matchState> <round> <p1 rounds won> <p2 rounds won>
 //                      <p1 word x ticks> <p2 word x ticks> <capture CSV row>
-//   agent -> game    A <w0> <w1> ... <w(ticks-1)>     P1's input words, one per tick
+//   agent -> game    A <w0> <w1> ... <w(ticks-1)>     the agent's chair's input words, one per tick
+//                    B <w0> ... <w(ticks-1)> <v0> ... <v(ticks-1)>
+//                      VERSUS only (SFE_VERSUS=1): the agent's chair, then the OTHER chair, so one
+//                      agent process plays both sides in lockstep (bot vs a cloned opponent). Outside
+//                      versus the second half is ignored: the other chair is the COM's.
 //
 // The S words are what both characters actually played on the last `ticks` fight ticks, oldest
 // first (zero-padded at a round's first decision): the joint action history a policy observes.
 // Bit i of a word is SokuBot's BUTTONS[i] (up down left right a b c d change spell).
 // S is sent every `ticks` fight ticks (matchState 2) and once on the tick a round stops (3 or 5),
-// whose row carries the KO. Every S is answered by exactly one A -- the one after a round stops is
-// ignored -- so the two sides can never drift out of step.
+// whose row carries the KO. Every S is answered by exactly one A (or B) -- the one after a round
+// stops is ignored -- so the two sides can never drift out of step.
 
 bool requested();                 // SFE_AGENT is set
 bool connect(int retry_ms);       // false if it never connects within retry_ms
