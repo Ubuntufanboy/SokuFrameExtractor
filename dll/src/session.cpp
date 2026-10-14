@@ -2506,6 +2506,25 @@ static int __fastcall HookedBattleSceneProcess(void* This, void* edx) {
     return r;
 }
 
+// SFE_RENDER_EVERY=N (vs-COM loop only, never with SFE_AGENT_CAPTURE): the battle
+// scene's onRender (vtable slot 2) runs only on every Nth call; N=0 never. Game
+// logic (onProcess) is untouched -- only the draw work is skipped. Unset = no hook.
+static PFN_sceneProcess s_orig_battle_render = nullptr;
+static int              s_render_every       = -1;
+static unsigned long    s_render_calls       = 0;
+
+static int __fastcall HookedBattleSceneRender(void* This, void* edx) {
+    const unsigned long n = s_render_calls++;
+    if (n < 3 || (s_render_every > 0 && n % static_cast<unsigned long>(s_render_every) == 0))
+    {
+        const int rv = s_orig_battle_render(This, edx);
+        static int s_logged = 0;
+        if (s_logged < 5) { ++s_logged; sfe::log("vscom: onRender original returned %d (call %lu)", rv & 0xFF, n); }
+        return rv;
+    }
+    return 1;
+}
+
 static bool patchSlot(DWORD* vtbl, int slot, DWORD fn, DWORD* orig) {
     DWORD oldProt = 0;
     if (!VirtualProtect(vtbl, 8 * sizeof(DWORD), PAGE_READWRITE, &oldProt)) return false;
@@ -2533,6 +2552,17 @@ static bool installBattleSceneHook() {
     }
     s_battle_scene_vtbl = vtbl;
     s_orig_battle_scene = reinterpret_cast<PFN_sceneProcess>(orig);
+    if (const char* re = getenv("SFE_RENDER_EVERY"); re && *re && !getenv("SFE_AGENT_CAPTURE")) {
+        s_render_every = static_cast<int>(strtol(re, nullptr, 10));
+        if (s_render_every < 0) s_render_every = -1;
+        DWORD rorig = 0;
+        if (s_render_every >= 0 && !s_orig_battle_render
+            && patchSlot(vtbl, 2, reinterpret_cast<DWORD>(HookedBattleSceneRender), &rorig)) {
+            s_orig_battle_render = reinterpret_cast<PFN_sceneProcess>(rorig);
+            sfe::log("vscom: battle scene onRender hooked (every %d, orig=%p)",
+                     s_render_every, reinterpret_cast<void*>(rorig));
+        }
+    }
     sfe::log("vscom: battle scene onProcess hooked (vtbl=%p orig=%p): results -> title",
              vtbl, reinterpret_cast<void*>(orig));
     return true;
@@ -2542,6 +2572,10 @@ static void restoreBattleSceneHook() {
     if (!s_battle_scene_vtbl || !s_orig_battle_scene) return;
     patchSlot(s_battle_scene_vtbl, VTBL_SCENE_ONPROCESS,
               reinterpret_cast<DWORD>(s_orig_battle_scene), nullptr);
+    if (s_orig_battle_render) {
+        patchSlot(s_battle_scene_vtbl, 2, reinterpret_cast<DWORD>(s_orig_battle_render), nullptr);
+        s_orig_battle_render = nullptr;
+    }
     s_battle_scene_vtbl = nullptr;
     s_orig_battle_scene = nullptr;
 }
